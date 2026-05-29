@@ -46,7 +46,7 @@ SAMPLE_RATE = 16000
 # How often to push audio into the streaming model + poll for output.
 # Smaller = lower latency, more CPU. Larger = more right-context per forward
 # pass, so fewer visible "wrong then corrected" revisions.
-LIVE_PUSH_INTERVAL_S = float(os.environ.get("TYPER_PUSH_S", "1.0"))
+LIVE_PUSH_INTERVAL_S = float(os.environ.get("TYPER_PUSH_S", "0.5"))
 
 # Streaming-quality knobs for parakeet_mlx.transcribe_stream().
 # depth: how many encoder layers carry exact KV-cache across chunks. Higher
@@ -58,16 +58,16 @@ STREAM_DEPTH = int(os.environ.get("TYPER_STREAM_DEPTH", "8"))
 #   right_context = the model sees further ahead before committing tokens,
 #   directly reducing revisions (but adds inherent latency).
 STREAM_LEFT_CTX  = int(os.environ.get("TYPER_STREAM_LEFT_CTX", "256"))
-STREAM_RIGHT_CTX = int(os.environ.get("TYPER_STREAM_RIGHT_CTX", "512"))
+STREAM_RIGHT_CTX = int(os.environ.get("TYPER_STREAM_RIGHT_CTX", "384"))
 # Preserve original (non-local) attention during streaming. More accurate
 #   but heavier; off by default in the library.
-STREAM_KEEP_ORIG_ATTN = os.environ.get("TYPER_STREAM_KEEP_ORIG_ATTN", "1") == "1"
+STREAM_KEEP_ORIG_ATTN = os.environ.get("TYPER_STREAM_KEEP_ORIG_ATTN", "0") == "1"
 
 # Beam search decoding (vs greedy). Beam explores multiple hypotheses per
 #   step and picks the best — lower WER, especially on accents / noisy
 #   audio / homophones, at higher compute per chunk. Set BEAM_SIZE=1 to
 #   fall back to greedy.
-BEAM_SIZE         = int(os.environ.get("TYPER_BEAM_SIZE", "5"))
+BEAM_SIZE         = int(os.environ.get("TYPER_BEAM_SIZE", "3"))
 BEAM_LEN_PENALTY  = float(os.environ.get("TYPER_BEAM_LEN_PENALTY", "1.0"))
 BEAM_PATIENCE     = float(os.environ.get("TYPER_BEAM_PATIENCE", "1.0"))
 # TDT-only: how strongly to reward longer-duration emissions. The library
