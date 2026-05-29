@@ -1,0 +1,7 @@
+parakeet-mlx
+pynput
+pyperclip
+sounddevice
+numpy
+silero-vad
+onnxruntime
