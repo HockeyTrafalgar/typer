@@ -36,6 +36,7 @@ import torch
 
 from pynput import keyboard
 import parakeet_mlx
+from parakeet_mlx.parakeet import DecodingConfig, Greedy, Beam
 from silero_vad import load_silero_vad
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
@@ -43,8 +44,48 @@ MODEL_ID = os.environ.get("TYPER_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
 SAMPLE_RATE = 16000
 
 # How often to push audio into the streaming model + poll for output.
-# Smaller = lower latency, more CPU. 0.4s is a good balance on M-series.
-LIVE_PUSH_INTERVAL_S = float(os.environ.get("TYPER_PUSH_S", "0.4"))
+# Smaller = lower latency, more CPU. Larger = more right-context per forward
+# pass, so fewer visible "wrong then corrected" revisions.
+LIVE_PUSH_INTERVAL_S = float(os.environ.get("TYPER_PUSH_S", "1.0"))
+
+# Streaming-quality knobs for parakeet_mlx.transcribe_stream().
+# depth: how many encoder layers carry exact KV-cache across chunks. Higher
+#   = streaming output more closely matches a full non-streaming pass (fewer
+#   revisions), at the cost of more compute/memory per chunk. Default in
+#   the library is 1; we push to 4 for noticeably more stable partials.
+STREAM_DEPTH = int(os.environ.get("TYPER_STREAM_DEPTH", "8"))
+# (left_context, right_context) attention window in encoder frames. Larger
+#   right_context = the model sees further ahead before committing tokens,
+#   directly reducing revisions (but adds inherent latency).
+STREAM_LEFT_CTX  = int(os.environ.get("TYPER_STREAM_LEFT_CTX", "256"))
+STREAM_RIGHT_CTX = int(os.environ.get("TYPER_STREAM_RIGHT_CTX", "512"))
+# Preserve original (non-local) attention during streaming. More accurate
+#   but heavier; off by default in the library.
+STREAM_KEEP_ORIG_ATTN = os.environ.get("TYPER_STREAM_KEEP_ORIG_ATTN", "1") == "1"
+
+# Beam search decoding (vs greedy). Beam explores multiple hypotheses per
+#   step and picks the best — lower WER, especially on accents / noisy
+#   audio / homophones, at higher compute per chunk. Set BEAM_SIZE=1 to
+#   fall back to greedy.
+BEAM_SIZE         = int(os.environ.get("TYPER_BEAM_SIZE", "5"))
+BEAM_LEN_PENALTY  = float(os.environ.get("TYPER_BEAM_LEN_PENALTY", "1.0"))
+BEAM_PATIENCE     = float(os.environ.get("TYPER_BEAM_PATIENCE", "1.0"))
+# TDT-only: how strongly to reward longer-duration emissions. The library
+#   default is 0.7; tweak if you see the model rushing or stalling.
+BEAM_DUR_REWARD   = float(os.environ.get("TYPER_BEAM_DUR_REWARD", "0.7"))
+
+def _build_decoding_config():
+    if BEAM_SIZE <= 1:
+        log.info("decoding: greedy")
+        return DecodingConfig(decoding=Greedy())
+    log.info("decoding: beam size=%d len_penalty=%.2f patience=%.2f dur_reward=%.2f",
+             BEAM_SIZE, BEAM_LEN_PENALTY, BEAM_PATIENCE, BEAM_DUR_REWARD)
+    return DecodingConfig(decoding=Beam(
+        beam_size=BEAM_SIZE,
+        length_penalty=BEAM_LEN_PENALTY,
+        patience=BEAM_PATIENCE,
+        duration_reward=BEAM_DUR_REWARD,
+    ))
 
 # Single keyboard controller for synthetic keystrokes. We use pynput rather
 # than pyautogui for injection: pyautogui's hotkey() leaves the Command
@@ -127,10 +168,11 @@ log = logging.getLogger("typer")
 
 # ── STATE ────────────────────────────────────────────────────────────────────
 model            = None
-model_loaded     = threading.Event()
+model_loaded     = threading.Event()  # set on success OR failure; check `model` for actual readiness
 
 live_active      = False
 live_stop_event  = threading.Event()
+live_state_lock  = threading.Lock()  # serializes start/stop transitions
 
 f19_held         = False  # edge-detect F19 press (toggles live mode)
 rcmd_held        = False  # tracks Right-⌘ hold-to-talk state
@@ -146,7 +188,6 @@ def inference_worker():
     log.info("inference worker starting")
     try:
         mx.set_default_device(mx.gpu)
-        mx.default_stream(mx.gpu)
         _ = (mx.zeros((1,)) + 1).item()
         log.debug("MLX GPU warm-up ok")
     except Exception:
@@ -156,15 +197,19 @@ def inference_worker():
     t0 = time.time()
     try:
         model = parakeet_mlx.from_pretrained(MODEL_ID)
+        log.info("Parakeet ready in %.1fs", time.time() - t0)
+        try:
+            _get_vad_model()
+        except Exception:
+            log.exception("VAD load failed (continuing without VAD)")
     except Exception:
-        log.exception("model load failed")
-        raise
-    log.info("Parakeet ready in %.1fs", time.time() - t0)
-    try:
-        _get_vad_model()
-    except Exception:
-        log.exception("VAD load failed (continuing without VAD)")
-    model_loaded.set()
+        log.exception("model load failed — dictation will be unavailable")
+    finally:
+        # Always release the main thread; it checks `model is not None` to know
+        # whether load actually succeeded.
+        model_loaded.set()
+    if model is None:
+        return
     while True:
         job = inference_q.get()
         log.debug("inference job: %r", job)
@@ -288,7 +333,6 @@ def _paste_text(text):
     with _kbd.pressed(keyboard.Key.cmd):
         _kbd.press('v')
         _kbd.release('v')
-    _release_modifiers()
 
 def _emit_diff(current, last):
     """Reconcile what's in the field (last) with the new transcript (current).
@@ -368,7 +412,15 @@ def _do_live_stream():
 
     t_start = time.time()
     try:
-        with model.transcribe_stream() as stream, sd.InputStream(
+        log.info("stream cfg: depth=%d context=(%d,%d) keep_orig_attn=%s push=%.2fs",
+                 STREAM_DEPTH, STREAM_LEFT_CTX, STREAM_RIGHT_CTX,
+                 STREAM_KEEP_ORIG_ATTN, LIVE_PUSH_INTERVAL_S)
+        with model.transcribe_stream(
+            context_size=(STREAM_LEFT_CTX, STREAM_RIGHT_CTX),
+            depth=STREAM_DEPTH,
+            keep_original_attention=STREAM_KEEP_ORIG_ATTN,
+            decoding_config=_build_decoding_config(),
+        ) as stream, sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
             dtype="float32",
@@ -379,7 +431,16 @@ def _do_live_stream():
             while not live_stop_event.is_set():
                 time.sleep(LIVE_PUSH_INTERVAL_S)
                 iters += 1
+                t_tick = time.time()
                 _drain_and_emit(stream)
+                tick_ms = (time.time() - t_tick) * 1000.0
+                try:
+                    active_mb = mx.get_active_memory() / (1024 * 1024)
+                    peak_mb = mx.get_peak_memory() / (1024 * 1024)
+                    log.debug("tick %d: drain+infer=%.0fms mlx_active=%.0fMB peak=%.0fMB",
+                              iters, tick_ms, active_mb, peak_mb)
+                except Exception:
+                    log.debug("tick %d: drain+infer=%.0fms", iters, tick_ms)
             # Final flush — capture the tail spoken in the last interval.
             log.debug("final flush after %d iters", iters)
             _drain_and_emit(stream)
@@ -398,14 +459,15 @@ def _do_live_stream():
 # ── LIVE START/STOP ──────────────────────────────────────────────────────────
 def start_live_dictation():
     global live_active
-    if live_active:
-        log.debug("start_live_dictation: already active, ignoring")
-        return
-    if not model_loaded.is_set():
-        log.warning("model not loaded yet; ignoring start")
-        return
-    live_active = True
-    live_stop_event.clear()
+    with live_state_lock:
+        if live_active:
+            log.debug("start_live_dictation: already active, ignoring")
+            return
+        if not model_loaded.is_set() or model is None:
+            log.warning("model not loaded; ignoring start")
+            return
+        live_stop_event.clear()
+        live_active = True
     log.info("🎤 Live — speak now")
     threading.Thread(target=lambda: subprocess.run(
         ['afplay', '/System/Library/Sounds/Blow.aiff'],
@@ -415,11 +477,12 @@ def start_live_dictation():
 
 def stop_live_dictation():
     global live_active
-    if not live_active:
-        log.debug("stop_live_dictation: not active, ignoring")
-        return
-    live_active = False
-    live_stop_event.set()
+    with live_state_lock:
+        if not live_active:
+            log.debug("stop_live_dictation: not active, ignoring")
+            return
+        live_active = False
+        live_stop_event.set()
     log.info("✅ stopped")
     threading.Thread(target=lambda: subprocess.run(
         ['afplay', '/System/Library/Sounds/Funk.aiff'],
@@ -477,6 +540,9 @@ def main():
                      name="inference").start()
     log.info("loading model in background...")
     model_loaded.wait()
+    if model is None:
+        log.critical("model load failed — exiting")
+        sys.exit(1)
     log.info("🟢 ready. Hold Right-⌘ to talk, or tap F19 to toggle.")
 
     def _cleanup():
