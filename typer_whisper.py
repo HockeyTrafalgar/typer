@@ -103,11 +103,16 @@ from AppKit import (
 # refraction). Import is wrapped so the script still loads on older
 # macOS, where these symbols are absent.
 try:
-    from AppKit import NSGlassEffectView, NSGlassEffectViewStyleRegular
+    from AppKit import (
+        NSGlassEffectView,
+        NSGlassEffectViewStyleRegular,
+        NSGlassEffectViewStyleClear,
+    )
     _LIQUID_GLASS_AVAILABLE = True
 except ImportError:
     NSGlassEffectView = None
     NSGlassEffectViewStyleRegular = None
+    NSGlassEffectViewStyleClear = None
     _LIQUID_GLASS_AVAILABLE = False
 from Quartz import kCACornerCurveContinuous
 from Foundation import NSObject
@@ -271,7 +276,7 @@ OVERLAY_USE_GLASS     = (
 # Whole-panel alpha applied on top of the vibrancy material. 1.0 = the
 # material's native opacity (still translucent thanks to blur); lower
 # values fade everything (background AND text) toward fully see-through.
-OVERLAY_ALPHA         = float(os.environ.get("TYPER_OVERLAY_ALPHA", "0.92"))
+OVERLAY_ALPHA         = float(os.environ.get("TYPER_OVERLAY_ALPHA", "1.0"))
 #   "caret"  — sit next to the focused text-input caret via macOS
 #              Accessibility API (best UX; requires AX permission).
 #   "cursor" — anchor to the mouse cursor position.
@@ -645,17 +650,24 @@ class _OverlayController(NSObject):
         # init() so the subview construction below is identical.
         if OVERLAY_USE_GLASS:
             bg = NSGlassEffectView.alloc().initWithFrame_(rect)
+            # "Clear" style is the more transparent of the two Liquid
+            # Glass presets — lets more of the wallpaper / window
+            # behind the HUD through. Fall through to Regular if it's
+            # unavailable on this build.
             try:
-                bg.setStyle_(NSGlassEffectViewStyleRegular)
+                bg.setStyle_(NSGlassEffectViewStyleClear)
             except Exception:
-                pass
+                try:
+                    bg.setStyle_(NSGlassEffectViewStyleRegular)
+                except Exception:
+                    pass
             bg.setCornerRadius_(OVERLAY_CORNER_RADIUS)
-            # Brighter white tint so the glass reads as a clearly-lit
-            # input surface (was 0.18; user feedback wanted it
-            # noticeably brighter). The text contrast against the
-            # tinted glass stays comfortable at 32% alpha.
+            # Very light white tint to preserve some contrast against
+            # busy/dark wallpapers without painting over the
+            # refraction. Drop to clearColor for the most see-through
+            # look (text legibility can suffer on dark wallpapers).
             bg.setTintColor_(
-                NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.32)
+                NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.10)
             )
             bg.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             # NSGlassEffectView ships with no contentView by default —
