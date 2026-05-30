@@ -67,6 +67,19 @@ from AppKit import (
     NSImageView, NSImageSymbolConfiguration, NSTextAlignmentCenter,
     NSFontAttributeName,
 )
+# Liquid Glass APIs — shipped in macOS 26 (Tahoe, WWDC '25). When
+# present we use NSGlassEffectView for proper refractive glass that
+# adapts to whatever's behind the panel; otherwise we keep the older
+# NSVisualEffectView path (which uses blur+vibrancy instead of true
+# refraction). Import is wrapped so the script still loads on older
+# macOS, where these symbols are absent.
+try:
+    from AppKit import NSGlassEffectView, NSGlassEffectViewStyleRegular
+    _LIQUID_GLASS_AVAILABLE = True
+except ImportError:
+    NSGlassEffectView = None
+    NSGlassEffectViewStyleRegular = None
+    _LIQUID_GLASS_AVAILABLE = False
 from Quartz import (
     CABasicAnimation, CAKeyframeAnimation, kCACornerCurveContinuous,
 )
@@ -218,6 +231,13 @@ OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "22"))
 OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "32"))
 OVERLAY_PAD_X         = float(os.environ.get("TYPER_OVERLAY_PAD_X", "28"))
 OVERLAY_PAD_Y         = float(os.environ.get("TYPER_OVERLAY_PAD_Y", "14"))
+# Use Apple's Liquid Glass material (macOS 26 Tahoe+) instead of the
+# older NSVisualEffectView blur. Set TYPER_OVERLAY_GLASS=0 to force the
+# legacy path even on Tahoe (useful if a specific build of macOS has
+# a Liquid Glass regression).
+OVERLAY_USE_GLASS     = (
+    os.environ.get("TYPER_OVERLAY_GLASS", "1") == "1" and _LIQUID_GLASS_AVAILABLE
+)
 # Whole-panel alpha applied on top of the vibrancy material. 1.0 = the
 # material's native opacity (still translucent thanks to blur); lower
 # values fade everything (background AND text) toward fully see-through.
@@ -583,40 +603,68 @@ class _OverlayController(NSObject):
             | NSWindowCollectionBehaviorIgnoresCycle
         )
 
-        # ── Vibrancy surface (light glass) ─────────────────────────────
-        # Popover material + vibrant-light appearance gives the soft
-        # near-white translucent look the design calls for, regardless
-        # of the system's global Light/Dark setting.
-        ve = NSVisualEffectView.alloc().initWithFrame_(rect)
-        ve.setMaterial_(NSVisualEffectMaterialPopover)
-        ve.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        ve.setState_(NSVisualEffectStateActive)
-        ve.setAppearance_(
-            NSAppearance.appearanceNamed_(NSAppearanceNameVibrantLight)
-        )
-        ve.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-        # Vibrancy material is composited outside the layer tree — only
-        # a mask image actually clips it. Layer cornerRadius alone leaves
-        # bright triangles in the rectangular corners.
-        ve.setMaskImage_(_rounded_mask_image(OVERLAY_CORNER_RADIUS))
-        ve.setWantsLayer_(True)
-        layer = ve.layer()
-        layer.setCornerRadius_(OVERLAY_CORNER_RADIUS)
-        try:
-            layer.setCornerCurve_(kCACornerCurveContinuous)
-        except Exception:
-            pass
-        layer.setMasksToBounds_(True)
-        # 1pt black @ 8% — matches CSS spec
-        # `border: 1px solid rgba(0, 0, 0, 0.08)`. Subtle but visible
-        # against light wallpapers and on the light glass itself.
-        layer.setBorderWidth_(1.0)
-        layer.setBorderColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.08).CGColor()
-        )
-        self.panel.setContentView_(ve)
+        # ── Background surface ─────────────────────────────────────────
+        # Two paths:
+        #   Liquid Glass (macOS 26+) — true refractive material that
+        #     bends light from the wallpaper behind it. Has first-class
+        #     cornerRadius and a real contentView, so no mask-image hack.
+        #   Vibrancy fallback — NSVisualEffectView + vibrant-light, with
+        #     a 9-slice mask image to clip the blur (cornerRadius alone
+        #     doesn't actually clip the vibrancy material).
+        # Both surfaces present the same `content` view to the rest of
+        # init() so the subview construction below is identical.
+        if OVERLAY_USE_GLASS:
+            bg = NSGlassEffectView.alloc().initWithFrame_(rect)
+            try:
+                bg.setStyle_(NSGlassEffectViewStyleRegular)
+            except Exception:
+                pass
+            bg.setCornerRadius_(OVERLAY_CORNER_RADIUS)
+            # Light off-white tint so the glass reads as a calm input
+            # surface instead of fully transparent. Slightly biased
+            # toward white because dark wallpapers would otherwise make
+            # the text label fight for contrast against neutral glass.
+            bg.setTintColor_(
+                NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.18)
+            )
+            bg.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            # NSGlassEffectView ships with no contentView by default —
+            # we must install one explicitly. All our subviews (dot,
+            # text, mic, esc) sit on this plain NSView so they render
+            # ABOVE the glass material, not refracted by it.
+            content = NSView.alloc().initWithFrame_(rect)
+            content.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            bg.setContentView_(content)
+            self.panel.setContentView_(bg)
+            log.debug("overlay background: NSGlassEffectView (Liquid Glass)")
+        else:
+            bg = NSVisualEffectView.alloc().initWithFrame_(rect)
+            bg.setMaterial_(NSVisualEffectMaterialPopover)
+            bg.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+            bg.setState_(NSVisualEffectStateActive)
+            bg.setAppearance_(
+                NSAppearance.appearanceNamed_(NSAppearanceNameVibrantLight)
+            )
+            bg.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            bg.setMaskImage_(_rounded_mask_image(OVERLAY_CORNER_RADIUS))
+            bg.setWantsLayer_(True)
+            layer = bg.layer()
+            layer.setCornerRadius_(OVERLAY_CORNER_RADIUS)
+            try:
+                layer.setCornerCurve_(kCACornerCurveContinuous)
+            except Exception:
+                pass
+            layer.setMasksToBounds_(True)
+            layer.setBorderWidth_(1.0)
+            layer.setBorderColor_(
+                NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.08).CGColor()
+            )
+            self.panel.setContentView_(bg)
+            content = bg  # legacy path: subviews go straight on the VE view
+            log.debug("overlay background: NSVisualEffectView (legacy vibrancy)")
         self.panel.invalidateShadow()
-        self._bg = ve
+        self._bg = bg
+        self._content = content
 
         # ── Recording indicator (red dot with glowing halo) ────────────
         # CRITICAL: halo and dot are SIBLINGS, not parent/child. The
@@ -651,7 +699,7 @@ class _OverlayController(NSObject):
         breathe.setAutoreverses_(True)
         breathe.setRepeatCount_(1e9)
         halo.layer().addAnimation_forKey_(breathe, "breathe")
-        ve.addSubview_(halo)
+        content.addSubview_(halo)
 
         dot = NSView.alloc().initWithFrame_(NSMakeRect(
             center_x - dot_size / 2.0, center_y - dot_size / 2.0,
@@ -660,7 +708,7 @@ class _OverlayController(NSObject):
         dot.setWantsLayer_(True)
         dot.layer().setCornerRadius_(dot_size / 2.0)
         dot.layer().setBackgroundColor_(red.CGColor())
-        ve.addSubview_(dot)
+        content.addSubview_(dot)
         self._dot = dot
         self._halo = halo
 
@@ -696,7 +744,7 @@ class _OverlayController(NSObject):
             mic_view.setContentTintColor_(NSColor.secondaryLabelColor())
         except Exception:
             pass
-        ve.addSubview_(mic_view)
+        content.addSubview_(mic_view)
         self._mic = mic_view
 
         # "esc" pill — tappable-looking key cap. Background is a faint
@@ -738,7 +786,7 @@ class _OverlayController(NSObject):
         # for these dimensions, shift upward.
         esc_label.setFrame_(NSMakeRect(0, 5.0, esc_w, esc_h - 5.0))
         esc_bg.addSubview_(esc_label)
-        ve.addSubview_(esc_bg)
+        content.addSubview_(esc_bg)
         self._esc = esc_bg
 
         # Vertical separator hairline between the text area and the
@@ -751,7 +799,7 @@ class _OverlayController(NSObject):
         sep.layer().setBackgroundColor_(
             NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.12).CGColor()
         )
-        ve.addSubview_(sep)
+        content.addSubview_(sep)
         self._sep = sep
 
         # ── Transcript label ───────────────────────────────────────────
@@ -782,7 +830,7 @@ class _OverlayController(NSObject):
         cell.setLineBreakMode_(NSLineBreakByTruncatingHead)
         cell.setWraps_(False)
         cell.setScrollable_(False)
-        ve.addSubview_(self.label)
+        content.addSubview_(self.label)
         self._text_x = text_x
         self._text_max_w = text_w
 
@@ -807,7 +855,7 @@ class _OverlayController(NSObject):
         blink.setDuration_(1.05)
         blink.setRepeatCount_(1e9)
         caret.layer().addAnimation_forKey_(blink, "blink")
-        ve.addSubview_(caret)
+        content.addSubview_(caret)
         self._caret = caret
 
         # State for show_/setText_ transitions.
