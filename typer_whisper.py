@@ -63,6 +63,7 @@ from AppKit import (
     NSLineBreakByTruncatingHead,
     NSViewWidthSizable, NSViewHeightSizable,
     NSAppearance, NSAppearanceNameVibrantDark,
+    NSImage, NSBezierPath, NSEdgeInsetsMake, NSImageResizingModeStretch,
 )
 from Quartz import (
     CABasicAnimation, kCACornerCurveContinuous,
@@ -457,6 +458,32 @@ def _get_vad_model():
 # but cache it anyway to avoid the repeated cross-process IPC.
 _ax_system = AXUIElementCreateSystemWide()
 
+
+def _rounded_mask_image(radius):
+    """Build a 9-slice NSImage that clips an NSVisualEffectView to a
+    rounded-rect shape.
+
+    Why this exists: NSVisualEffectView's vibrancy material is composited
+    OUTSIDE the layer tree, so the usual `layer.cornerRadius` does not
+    actually clip it — the material spills into the rectangle's corners
+    and shows up as bright triangles against dark wallpapers (the bug
+    the user reported). The documented Apple fix is `setMaskImage_`
+    with a 9-part resizable rounded-corner image: the corners are
+    drawn 1:1, the edges and center stretch to fill any panel size.
+    """
+    diameter = radius * 2 + 1
+    img = NSImage.alloc().initWithSize_(NSMakeSize(diameter, diameter))
+    img.lockFocus()
+    path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        NSMakeRect(0, 0, diameter, diameter), radius, radius
+    )
+    NSColor.blackColor().setFill()
+    path.fill()
+    img.unlockFocus()
+    img.setCapInsets_(NSEdgeInsetsMake(radius, radius, radius, radius))
+    img.setResizingMode_(NSImageResizingModeStretch)
+    return img
+
 def _caret_screen_rect():
     """Return (x, y, w, h) of the focused-app's text caret in NSScreen
     coordinates (origin bottom-left of primary display), or None when
@@ -575,8 +602,16 @@ class _OverlayController(NSObject):
             NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark)
         )
         ve.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        # CRITICAL: round the vibrancy via a mask image, not via
+        # layer.cornerRadius. The vibrancy material is composited
+        # outside the layer tree, so cornerRadius can't clip it. Without
+        # the mask image, dark wallpapers show bright triangles in the
+        # window's rectangular corners — the bug the user hit.
+        ve.setMaskImage_(_rounded_mask_image(OVERLAY_CORNER_RADIUS))
         ve.setWantsLayer_(True)
         layer = ve.layer()
+        # The layer-level rounding still helps for the shadow/border
+        # (NSWindow synthesizes the shadow from the layer geometry).
         layer.setCornerRadius_(OVERLAY_CORNER_RADIUS)
         try:
             layer.setCornerCurve_(kCACornerCurveContinuous)
@@ -590,6 +625,10 @@ class _OverlayController(NSObject):
             NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.12).CGColor()
         )
         self.panel.setContentView_(ve)
+        # Force a shadow recompute now that the content shape is
+        # rounded — otherwise the cached shadow keeps the rectangular
+        # silhouette and shows white halos at the corners.
+        self.panel.invalidateShadow()
         self._bg = ve
 
         # ── Recording indicator (red pulsing dot) ──────────────────────
