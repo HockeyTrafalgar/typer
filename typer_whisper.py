@@ -261,7 +261,7 @@ OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "780"))
 # grows past this as the transcript wraps, capped at OVERLAY_MAX_H.
 OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "72"))
 OVERLAY_MAX_H        = int(os.environ.get("TYPER_OVERLAY_MAX_H", "320"))
-OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "19"))
+OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "21"))
 # Spotlight uses a fully-rounded pill (radius = H/2). Default to that.
 OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "36"))
 OVERLAY_PAD_X         = float(os.environ.get("TYPER_OVERLAY_PAD_X", "28"))
@@ -712,7 +712,7 @@ class _OverlayController(NSObject):
         # Spotlight-style layout: one icon on the left, text fills the
         # rest. No right-side controls. SF Symbol "mic" at body weight,
         # tinted to match the placeholder text color.
-        mic_size = 22.0
+        mic_size = 26.0
         try:
             mic_cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
                 mic_size, NSFontWeightRegular
