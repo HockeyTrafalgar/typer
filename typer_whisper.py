@@ -113,7 +113,14 @@ TYPER_MODE = os.environ.get("TYPER_MODE", "batch").lower()
 # the diff-paste tick (stream mode). Whisper is not natively streaming,
 # so each tick re-runs the model on the full voiced audio captured so
 # far. Larger = lower CPU/GPU load, more lag in the overlay preview.
-LIVE_PUSH_INTERVAL_S = float(os.environ.get("TYPER_PUSH_S", "1.0"))
+#
+# Note: this is the MINIMUM wait between ticks; if inference takes
+# longer than the interval (very likely with whisper-large-v3 once the
+# buffer grows past ~5 s), the real cadence is bounded by inference time.
+# If you want truly snappy feedback, switch to a faster model:
+#   TYPER_MODEL=mlx-community/whisper-large-v3-turbo  # ~3× faster
+#   TYPER_MODEL=mlx-community/whisper-small-mlx       # ~10× faster
+LIVE_PUSH_INTERVAL_S = float(os.environ.get("TYPER_PUSH_S", "0.35"))
 
 # Optional explicit language code (e.g. "en", "ru"). Empty = auto-detect
 # per inference call. Setting this skips detection and saves a bit of time.
