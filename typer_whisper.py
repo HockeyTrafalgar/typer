@@ -1028,7 +1028,28 @@ def main():
             stop_live_dictation()
         overlay_hide()
     atexit.register(_cleanup)
-    signal.signal(signal.SIGTERM, lambda *a: (log.info("SIGTERM"), _cleanup(), sys.exit(0)))
+
+    # Hard SIGINT / SIGTERM handlers. AppHelper.runEventLoop(installInterrupt
+    # =True) installs a Mach-port-based handler that only stops the run loop
+    # on the NEXT main-thread event — when the loop is idle (our normal
+    # state, since we get no UI events until the user touches the HUD), the
+    # signal is queued but never delivered, so Ctrl+C appears to do nothing.
+    # We bypass that by installing our own handlers that force-exit. We do
+    # the kill via os._exit AFTER cleanup so atexit handlers still run and
+    # we don't get stuck waiting for the run loop to wake up.
+    def _force_exit(signame):
+        def _h(*_):
+            log.info("%s — force exit", signame)
+            try:
+                _cleanup()
+            finally:
+                # os._exit skips Python's normal shutdown (which would try
+                # to join the AppKit run loop thread — i.e. ourselves — and
+                # hang). atexit handlers we care about already ran above.
+                os._exit(0)
+        return _h
+    signal.signal(signal.SIGINT,  _force_exit("SIGINT"))
+    signal.signal(signal.SIGTERM, _force_exit("SIGTERM"))
 
     # The keyboard.Listener spawns its own Quartz event-tap thread, so we
     # can start it and leave the main thread free to run AppKit's run
@@ -1046,9 +1067,18 @@ def main():
         _overlay_controller = _OverlayController.alloc().init()
         log.info("overlay initialized (%dx%d, placement=%s)",
                  OVERLAY_W, OVERLAY_H, OVERLAY_PLACEMENT)
+        # Schedule a low-frequency timer that yields back to the Python
+        # interpreter on the main thread. CFRunLoopRun otherwise sleeps in
+        # mach_msg, where pending Python signal handlers can't fire. The
+        # timer body is empty — its only purpose is the periodic wake-up.
         try:
-            # AppHelper installs SIGINT handling so Ctrl+C cleanly stops
-            # the run loop instead of leaving us wedged in CFRunLoopRun.
+            from Foundation import NSTimer
+            NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+                0.25, True, lambda _t: None
+            )
+        except Exception:
+            log.debug("signal-yield timer install failed", exc_info=True)
+        try:
             AppHelper.runEventLoop(installInterrupt=True)
         except KeyboardInterrupt:
             log.info("shutting down (KeyboardInterrupt)")
