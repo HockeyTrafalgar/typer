@@ -88,8 +88,7 @@ from AppKit import (
     NSVisualEffectMaterialHUDWindow, NSVisualEffectMaterialPopover,
     NSVisualEffectBlendingModeBehindWindow,
     NSVisualEffectStateActive,
-    NSFontWeightRegular, NSFontWeightMedium, NSFontWeightSemibold,
-    NSLineBreakByTruncatingHead,
+    NSFontWeightRegular,
     NSViewWidthSizable, NSViewHeightSizable,
     NSAppearance, NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight,
     NSImage, NSBezierPath, NSEdgeInsetsMake, NSImageResizingModeStretch,
@@ -110,9 +109,7 @@ except ImportError:
     NSGlassEffectView = None
     NSGlassEffectViewStyleRegular = None
     _LIQUID_GLASS_AVAILABLE = False
-from Quartz import (
-    CABasicAnimation, CAKeyframeAnimation, kCACornerCurveContinuous,
-)
+from Quartz import kCACornerCurveContinuous
 from Foundation import NSObject
 from PyObjCTools import AppHelper
 
@@ -136,7 +133,6 @@ from ApplicationServices import (
 # AppKit doesn't always re-export this constant by name in PyObjC, so we
 # define it manually (NSWindowStyleMaskNonactivatingPanel = 1<<7).
 NSWindowStyleMaskNonactivatingPanel = 1 << 7
-NSWindowStyleMaskBorderless = 0
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 # Best available Whisper on MLX. Use "mlx-community/whisper-large-v3-turbo"
@@ -619,7 +615,7 @@ class _OverlayController(NSObject):
             return None
         # ── Panel ──────────────────────────────────────────────────────
         rect = NSMakeRect(0, 0, OVERLAY_W, OVERLAY_H)
-        style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+        style = NSWindowStyleMaskNonactivatingPanel
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             rect, style, NSBackingStoreBuffered, False
         )
@@ -767,10 +763,6 @@ class _OverlayController(NSObject):
         self._text_x = text_x
         self._text_max_w = text_w
         self._text_line_h = line_h
-        # Caret was removed at the user's request — _reposition_caret
-        # is a no-op now, but kept around so _render still calls
-        # something without an AttributeError.
-        self._caret = None
 
         # State for show_/setText_ transitions.
         self._current_text = ""
