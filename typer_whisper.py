@@ -39,6 +39,35 @@ import sounddevice as sd
 import mlx.core as mx
 import torch
 
+# ── Hugging Face cache short-circuit ─────────────────────────────────────────
+# mlx_whisper internally calls huggingface_hub.snapshot_download(), which
+# by default issues an HTTP GET to https://huggingface.co/api/models/...
+# every time we warm up — even when the weights are already on disk —
+# to check whether the cached revision is current. For an app that loads
+# the same pinned model on every launch, that costs us a ~200-800 ms
+# round-trip on each start and breaks the app when offline.
+#
+# Set HF_HUB_OFFLINE=1 BEFORE the mlx_whisper import (which is what
+# pulls in huggingface_hub) so the snapshot resolver skips the API
+# check and uses the cache directly. We do this automatically when the
+# repo is already cached; first run leaves it online so the initial
+# download works. TYPER_HF_OFFLINE=0 forces the online path even when
+# cached (useful if you want to pick up a newer revision).
+def _maybe_enable_hf_offline():
+    if os.environ.get("HF_HUB_OFFLINE") is not None:
+        return  # respect user override either direction
+    if os.environ.get("TYPER_HF_OFFLINE", "1") == "0":
+        return
+    repo = os.environ.get("TYPER_MODEL", "mlx-community/whisper-large-v3-mlx")
+    cache_root = Path(os.environ.get("HF_HOME") or
+                      Path.home() / ".cache" / "huggingface") / "hub"
+    cache_dir = cache_root / f"models--{repo.replace('/', '--')}"
+    if cache_dir.is_dir():
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        # Older huggingface_hub releases honored this constant instead.
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+_maybe_enable_hf_offline()
+
 from pynput import keyboard
 import mlx_whisper
 from silero_vad import load_silero_vad
