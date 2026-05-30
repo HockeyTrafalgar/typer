@@ -59,6 +59,22 @@ from AppKit import (
 from Foundation import NSObject
 from PyObjCTools import AppHelper
 
+# Accessibility API — used to locate the text caret of the focused field
+# so the overlay can sit next to it instead of next to the mouse cursor.
+# Requires the user to grant Accessibility permission to the Python binary
+# (System Settings → Privacy & Security → Accessibility). Apps that don't
+# expose AXSelectedTextRange / AXBoundsForRange (some Electron apps, GPU-
+# rendered terminals) silently fall back to the mouse-cursor position.
+from ApplicationServices import (
+    AXUIElementCreateSystemWide,
+    AXUIElementCopyAttributeValue,
+    AXUIElementCopyParameterizedAttributeValue,
+    AXValueGetValue,
+    kAXFocusedUIElementAttribute,
+    kAXSelectedTextRangeAttribute,
+    kAXValueCGRectType,
+)
+
 # NSPanel-only style mask that gives us a borderless, non-activating HUD.
 # AppKit doesn't always re-export this constant by name in PyObjC, so we
 # define it manually (NSWindowStyleMaskNonactivatingPanel = 1<<7).
@@ -173,7 +189,11 @@ OVERLAY_ENABLED   = os.environ.get("TYPER_OVERLAY", "1") == "1"
 OVERLAY_W         = int(os.environ.get("TYPER_OVERLAY_W", "640"))
 OVERLAY_H         = int(os.environ.get("TYPER_OVERLAY_H", "72"))
 OVERLAY_FONT_SIZE = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "18"))
-OVERLAY_PLACEMENT = os.environ.get("TYPER_OVERLAY_PLACEMENT", "cursor")  # "cursor" | "bottom"
+#   "caret"  — sit next to the focused text-input caret via macOS
+#              Accessibility API (best UX; requires AX permission).
+#   "cursor" — anchor to the mouse cursor position.
+#   "bottom" — centered at the bottom of the active screen.
+OVERLAY_PLACEMENT = os.environ.get("TYPER_OVERLAY_PLACEMENT", "caret")
 OVERLAY_BG_ALPHA  = float(os.environ.get("TYPER_OVERLAY_BG_ALPHA", "0.78"))
 
 # ── LOGGING ──────────────────────────────────────────────────────────────────
@@ -402,6 +422,69 @@ def _get_vad_model():
 
 
 # ── OVERLAY (floating HUD) ───────────────────────────────────────────────────
+# Module-level system-wide AX element. Created lazily and reused: cheap,
+# but cache it anyway to avoid the repeated cross-process IPC.
+_ax_system = AXUIElementCreateSystemWide()
+
+def _caret_screen_rect():
+    """Return (x, y, w, h) of the focused-app's text caret in NSScreen
+    coordinates (origin bottom-left of primary display), or None when
+    unavailable.
+
+    Failure modes that legitimately return None:
+      • No Accessibility permission for our Python binary.
+      • Focused element isn't a text field (no AXSelectedTextRange).
+      • App doesn't implement AXBoundsForRange (some Electron / GPU UIs).
+      • Caret is in an off-screen scrolled region.
+    Callers must fall back to the mouse cursor.
+    """
+    try:
+        err, focused = AXUIElementCopyAttributeValue(
+            _ax_system, kAXFocusedUIElementAttribute, None
+        )
+        if err or focused is None:
+            return None
+        err, range_val = AXUIElementCopyAttributeValue(
+            focused, kAXSelectedTextRangeAttribute, None
+        )
+        if err or range_val is None:
+            return None
+        # AXBoundsForRange takes the AXValue<CFRange> we just retrieved
+        # and returns an AXValue<CGRect>. The selection's range is fine
+        # even when length=0 (pure caret): bounds are reported as a
+        # zero-width rect at the caret's pixel position.
+        err, bounds_val = AXUIElementCopyParameterizedAttributeValue(
+            focused, "AXBoundsForRange", range_val, None
+        )
+        if err or bounds_val is None:
+            return None
+        ok, rect = AXValueGetValue(bounds_val, kAXValueCGRectType, None)
+        if not ok:
+            return None
+        # Some apps (and the case of "no text field focused at all")
+        # return a degenerate (0,0,0,0) rect rather than an error. Treat
+        # zero-sized rects as "no caret available" so we fall back.
+        if rect.size.width == 0 and rect.size.height == 0:
+            return None
+        # AX uses the global display coordinate space whose origin sits
+        # at the top-left of the primary display (y grows down). NSScreen
+        # uses the primary display's bottom-left (y grows up). Flip Y
+        # relative to the primary screen's height.
+        main = NSScreen.mainScreen()
+        if main is None:
+            return None
+        main_h = main.frame().size.height
+        x = rect.origin.x
+        # Subtract caret height too so y points to the BOTTOM of the
+        # caret in NS coords (which is where we want to anchor the
+        # overlay's top edge before going down by OVERLAY_H).
+        y = main_h - rect.origin.y - rect.size.height
+        return (float(x), float(y), float(rect.size.width), float(rect.size.height))
+    except Exception:
+        log.debug("caret lookup failed", exc_info=True)
+        return None
+
+
 class _OverlayController(NSObject):
     """Owns a non-activating NSPanel that floats above all windows and
     shows the live transcript. Methods are invoked via
@@ -470,23 +553,51 @@ class _OverlayController(NSObject):
         self.label.setStringValue_(text or "🎤 listening…")
 
     def _position_near_cursor(self):
-        loc = NSEvent.mouseLocation()  # screen coords, origin bottom-left
         screen = NSScreen.mainScreen()
-        if OVERLAY_PLACEMENT == "bottom" or screen is None:
-            vf = (screen or NSScreen.screens()[0]).visibleFrame()
+        vf = (screen or NSScreen.screens()[0]).visibleFrame()
+
+        if OVERLAY_PLACEMENT == "bottom":
             x = vf.origin.x + (vf.size.width - OVERLAY_W) / 2
             y = vf.origin.y + 40
-        else:
-            vf = screen.visibleFrame()
-            # Offset slightly down-right from the cursor so we don't sit
-            # under it (which would block the user's view of what they're
-            # about to click). Flip sides if we'd run off the screen.
-            x = loc.x + 18
-            y = loc.y - OVERLAY_H - 18
-            if x + OVERLAY_W > vf.origin.x + vf.size.width:
-                x = loc.x - OVERLAY_W - 18
-            if y < vf.origin.y:
-                y = loc.y + 18
+            self.panel.setFrameOrigin_(NSMakePoint(x, y))
+            return
+
+        if OVERLAY_PLACEMENT == "caret":
+            caret = _caret_screen_rect()
+            if caret is not None:
+                # caret = (x, y_bottom, w, h) in NSScreen coords; we want
+                # the overlay to hang JUST BELOW the caret line.
+                cx, cy, cw, ch = caret
+                # Anchor horizontally to the caret column, but indent a
+                # bit so the overlay's left edge doesn't sit on top of
+                # the caret itself.
+                x = cx + 6
+                # Overlay's bottom = caret's bottom - small pad - OVERLAY_H
+                y = cy - 6 - OVERLAY_H
+                # If we'd clip below the screen, place the overlay ABOVE
+                # the caret line instead (top of overlay sits above the
+                # caret's top edge by a small pad).
+                if y < vf.origin.y:
+                    y = cy + ch + 6
+                # Horizontal clamp.
+                if x + OVERLAY_W > vf.origin.x + vf.size.width:
+                    x = vf.origin.x + vf.size.width - OVERLAY_W - 8
+                if x < vf.origin.x:
+                    x = vf.origin.x + 8
+                self.panel.setFrameOrigin_(NSMakePoint(x, y))
+                return
+            # Caret lookup failed → fall through to cursor placement so
+            # the overlay still appears somewhere useful.
+            log.debug("caret unavailable, falling back to mouse cursor")
+
+        # "cursor" placement (or caret fallback).
+        loc = NSEvent.mouseLocation()
+        x = loc.x + 18
+        y = loc.y - OVERLAY_H - 18
+        if x + OVERLAY_W > vf.origin.x + vf.size.width:
+            x = loc.x - OVERLAY_W - 18
+        if y < vf.origin.y:
+            y = loc.y + 18
         self.panel.setFrameOrigin_(NSMakePoint(x, y))
 
 
