@@ -228,7 +228,8 @@ OVERLAY_ENABLED   = os.environ.get("TYPER_OVERLAY", "1") == "1"
 OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "780"))
 OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "72"))
 OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "22"))
-OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "32"))
+# Spotlight uses a fully-rounded pill (radius = H/2). Default to that.
+OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "36"))
 OVERLAY_PAD_X         = float(os.environ.get("TYPER_OVERLAY_PAD_X", "28"))
 OVERLAY_PAD_Y         = float(os.environ.get("TYPER_OVERLAY_PAD_Y", "14"))
 # Use Apple's Liquid Glass material (macOS 26 Tahoe+) instead of the
@@ -666,66 +667,17 @@ class _OverlayController(NSObject):
         self._bg = bg
         self._content = content
 
-        # ── Recording indicator (red dot with glowing halo) ────────────
-        # CRITICAL: halo and dot are SIBLINGS, not parent/child. The
-        # previous build nested the dot inside the halo and pulsed the
-        # halo's opacity, which cascaded to the dot and made the whole
-        # indicator wash out at the low end of the cycle. Siblings keep
-        # the solid dot anchored at full saturation while only the halo
-        # breathes.
-        dot_size = 14.0
-        halo_size = 28.0
-        center_y = OVERLAY_H / 2.0
-        center_x = OVERLAY_PAD_X + halo_size / 2.0
-        red = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.96, 0.28, 0.20, 1.0
-        )
-
-        halo = NSView.alloc().initWithFrame_(NSMakeRect(
-            center_x - halo_size / 2.0, center_y - halo_size / 2.0,
-            halo_size, halo_size
-        ))
-        halo.setWantsLayer_(True)
-        halo.layer().setCornerRadius_(halo_size / 2.0)
-        halo.layer().setBackgroundColor_(
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                0.96, 0.28, 0.20, 0.22
-            ).CGColor()
-        )
-        breathe = CABasicAnimation.animationWithKeyPath_("opacity")
-        breathe.setFromValue_(1.0)
-        breathe.setToValue_(0.35)
-        breathe.setDuration_(0.9)
-        breathe.setAutoreverses_(True)
-        breathe.setRepeatCount_(1e9)
-        halo.layer().addAnimation_forKey_(breathe, "breathe")
-        content.addSubview_(halo)
-
-        dot = NSView.alloc().initWithFrame_(NSMakeRect(
-            center_x - dot_size / 2.0, center_y - dot_size / 2.0,
-            dot_size, dot_size
-        ))
-        dot.setWantsLayer_(True)
-        dot.layer().setCornerRadius_(dot_size / 2.0)
-        dot.layer().setBackgroundColor_(red.CGColor())
-        content.addSubview_(dot)
-        self._dot = dot
-        self._halo = halo
-
-        # ── Right cluster: mic icon | esc pill | separator ─────────────
-        # Lay these out from the right edge inward so the text label can
-        # take all remaining space.
-        right_edge = OVERLAY_W - OVERLAY_PAD_X
-
-        # Mic icon (SF Symbol). Sized at body weight, secondary color
-        # so it reads as ambient indication rather than an action.
+        # ── Leading mic icon (SF Symbol) ───────────────────────────────
+        # Spotlight-style layout: one icon on the left, text fills the
+        # rest. No right-side controls. SF Symbol "mic" at body weight,
+        # tinted to match the placeholder text color.
         mic_size = 22.0
         try:
             mic_cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
                 mic_size, NSFontWeightRegular
             )
             mic_img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                "mic", "Microphone active"
+                "mic", "Dictation"
             )
             if mic_img is not None:
                 mic_img = mic_img.imageWithSymbolConfiguration_(mic_cfg)
@@ -733,7 +685,7 @@ class _OverlayController(NSObject):
             mic_img = None
         mic_view_w = mic_size + 4
         mic_view_h = mic_size + 4
-        mic_x = right_edge - mic_view_w
+        mic_x = OVERLAY_PAD_X
         mic_y = (OVERLAY_H - mic_view_h) / 2.0
         mic_view = NSImageView.alloc().initWithFrame_(
             NSMakeRect(mic_x, mic_y, mic_view_w, mic_view_h)
@@ -741,74 +693,22 @@ class _OverlayController(NSObject):
         if mic_img is not None:
             mic_view.setImage_(mic_img)
         try:
-            mic_view.setContentTintColor_(NSColor.secondaryLabelColor())
+            mic_view.setContentTintColor_(
+                NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
+            )
         except Exception:
             pass
         content.addSubview_(mic_view)
         self._mic = mic_view
 
-        # "esc" pill — tappable-looking key cap. Background is a faint
-        # gray fill; text uses the system label color at a small size.
-        esc_w, esc_h = 50.0, 30.0
-        esc_x = mic_x - 14.0 - esc_w
-        esc_y = (OVERLAY_H - esc_h) / 2.0
-        esc_bg = NSView.alloc().initWithFrame_(
-            NSMakeRect(esc_x, esc_y, esc_w, esc_h)
-        )
-        esc_bg.setWantsLayer_(True)
-        esc_bg_layer = esc_bg.layer()
-        esc_bg_layer.setCornerRadius_(8.0)
-        try:
-            esc_bg_layer.setCornerCurve_(kCACornerCurveContinuous)
-        except Exception:
-            pass
-        esc_bg_layer.setBackgroundColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.05).CGColor()
-        )
-        esc_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(0, 0, esc_w, esc_h)
-        )
-        esc_label.setEditable_(False)
-        esc_label.setSelectable_(False)
-        esc_label.setBezeled_(False)
-        esc_label.setDrawsBackground_(False)
-        esc_label.setFont_(
-            NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium)
-        )
-        esc_label.setTextColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
-        )
-        esc_label.setAlignment_(NSTextAlignmentCenter)
-        esc_label.setStringValue_("esc")
-        esc_label_cell = esc_label.cell()
-        esc_label_cell.setUsesSingleLineMode_(True)
-        # Vertically center: NSTextField baseline lands a couple px low
-        # for these dimensions, shift upward.
-        esc_label.setFrame_(NSMakeRect(0, 5.0, esc_w, esc_h - 5.0))
-        esc_bg.addSubview_(esc_label)
-        content.addSubview_(esc_bg)
-        self._esc = esc_bg
-
-        # Vertical separator hairline between the text area and the
-        # right cluster.
-        sep_h = OVERLAY_H * 0.45
-        sep_y = (OVERLAY_H - sep_h) / 2.0
-        sep_x = esc_x - 12.0
-        sep = NSView.alloc().initWithFrame_(NSMakeRect(sep_x, sep_y, 1.0, sep_h))
-        sep.setWantsLayer_(True)
-        sep.layer().setBackgroundColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.12).CGColor()
-        )
-        content.addSubview_(sep)
-        self._sep = sep
-
         # ── Transcript label ───────────────────────────────────────────
-        # NSTextField doesn't vertically center its text inside its
-        # frame; we approximate centering by sizing the frame to the
-        # font's natural line height and placing it at the row center.
-        text_x = OVERLAY_PAD_X + halo_size + 10.0
-        text_w = sep_x - text_x - 8.0
-        line_h = OVERLAY_FONT_SIZE * 1.35  # safe enough for SF Pro
+        # Spotlight-style placeholder typography: SF Pro Regular at the
+        # body size, muted near-black. Active transcript uses the same
+        # weight at full strength so the visual rhythm doesn't change
+        # mid-sentence.
+        text_x = mic_x + mic_view_w + 12.0
+        text_w = OVERLAY_W - text_x - OVERLAY_PAD_X
+        line_h = OVERLAY_FONT_SIZE * 1.35
         text_y = (OVERLAY_H - line_h) / 2.0
         self.label = NSTextField.alloc().initWithFrame_(
             NSMakeRect(text_x, text_y, text_w, line_h)
@@ -817,13 +717,12 @@ class _OverlayController(NSObject):
         self.label.setSelectable_(False)
         self.label.setBezeled_(False)
         self.label.setDrawsBackground_(False)
-        # Medium weight + 72% black, per the reference CSS
-        # (font-weight: 500, color: rgba(0,0,0,0.72)).
+        # Regular weight, matching the Spotlight Search placeholder.
         self.label.setFont_(
-            NSFont.systemFontOfSize_weight_(OVERLAY_FONT_SIZE, NSFontWeightMedium)
+            NSFont.systemFontOfSize_weight_(OVERLAY_FONT_SIZE, NSFontWeightRegular)
         )
         self.label.setTextColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.72)
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
         )
         self.label.setStringValue_("")
         cell = self.label.cell()
@@ -833,30 +732,10 @@ class _OverlayController(NSObject):
         content.addSubview_(self.label)
         self._text_x = text_x
         self._text_max_w = text_w
-
-        # ── Blinking insertion caret ───────────────────────────────────
-        # Sized to match the label's cap height so it reads as a real
-        # text caret. Hard on/off via keyframe timing (a smooth fade
-        # looks like UI breath, not a cursor).
-        caret_w = 2.0
-        caret_h = OVERLAY_FONT_SIZE + 6
-        caret_y = (OVERLAY_H - caret_h) / 2.0
-        caret = NSView.alloc().initWithFrame_(
-            NSMakeRect(text_x, caret_y, caret_w, caret_h)
-        )
-        caret.setWantsLayer_(True)
-        caret.layer().setBackgroundColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.72).CGColor()
-        )
-        caret.layer().setCornerRadius_(caret_w / 2.0)
-        blink = CAKeyframeAnimation.animationWithKeyPath_("opacity")
-        blink.setValues_([1.0, 1.0, 0.0, 0.0])
-        blink.setKeyTimes_([0.0, 0.5, 0.5, 1.0])
-        blink.setDuration_(1.05)
-        blink.setRepeatCount_(1e9)
-        caret.layer().addAnimation_forKey_(blink, "blink")
-        content.addSubview_(caret)
-        self._caret = caret
+        # Caret was removed at the user's request — _reposition_caret
+        # is a no-op now, but kept around so _render still calls
+        # something without an AttributeError.
+        self._caret = None
 
         # State for show_/setText_ transitions.
         self._current_text = ""
@@ -898,40 +777,17 @@ class _OverlayController(NSObject):
 
     @objc.python_method
     def _render(self, text, placeholder):
-        # Color: muted black for placeholders, the spec's 72% black for
-        # real transcribed content. Keeps both states on the same hue
-        # axis (no blue secondary-label tint).
+        # Color: muted near-black for placeholders (matching the
+        # Spotlight Search placeholder hue at ~55% black), real
+        # transcribed content at full 80% black so it visibly "wins"
+        # over the placeholder. Both stay on the same hue axis (no
+        # secondary-label blue tint).
         if placeholder:
-            color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.42)
+            color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
         else:
-            color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.72)
+            color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.80)
         self.label.setTextColor_(color)
         self.label.setStringValue_(text)
-        self._reposition_caret(text)
-
-    @objc.python_method
-    def _reposition_caret(self, text):
-        """Move the blinking caret to sit just after the rendered text.
-        Falls back to the left edge when measurement fails."""
-        try:
-            font = self.label.font()
-            attrs = {NSFontAttributeName: font}
-            measured = NSMakeSize(0, 0)
-            if text:
-                measured = (
-                    objc.lookUpClass("NSString")
-                    .stringWithString_(text)
-                    .sizeWithAttributes_(attrs)
-                )
-            # Clamp so the caret never spills past the right edge of the
-            # label's allotted column (matters when the text gets head-
-            # truncated and effectively fills the label).
-            advance = min(measured.width, self._text_max_w)
-            x = self._text_x + advance + 2.0
-            f = self._caret.frame()
-            self._caret.setFrame_(NSMakeRect(x, f.origin.y, f.size.width, f.size.height))
-        except Exception:
-            log.debug("caret reposition failed", exc_info=True)
 
     @objc.python_method
     def _position_near_cursor(self):
