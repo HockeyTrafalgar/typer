@@ -667,7 +667,7 @@ class _OverlayController(NSObject):
             # refraction. Drop to clearColor for the most see-through
             # look (text legibility can suffer on dark wallpapers).
             bg.setTintColor_(
-                NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.22)
+                NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.45)
             )
             bg.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             # NSGlassEffectView ships with no contentView by default —
