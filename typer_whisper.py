@@ -1097,7 +1097,16 @@ def _do_live_stream():
                   len(voiced_buf) / SAMPLE_RATE, infer_ms, text)
         return text
 
-    state = {"transitioned": False}
+    # Tracked so _commit_final can decide whether to rerun whisper. If
+    # the user releases right after a preview tick finished, the buffer
+    # has barely grown and we can paste the cached preview text instead
+    # of paying ~1-2 s for another large-v3 inference. Threshold below
+    # is in samples (0.4 s @ 16 kHz).
+    state = {
+        "transitioned": False,
+        "preview_buf_samples": 0,   # voiced_buf length at last successful preview
+    }
+    REUSE_PREVIEW_THRESHOLD_SAMPLES = int(0.4 * SAMPLE_RATE)
 
     def _tick_preview():
         """Per-interval tick during recording. Ingests audio, runs a
@@ -1115,6 +1124,7 @@ def _do_live_stream():
         text = _transcribe_buffer()
         if text is None:
             return
+        state["preview_buf_samples"] = len(voiced_buf)
         if TYPER_MODE == "stream":
             # Legacy: diff-paste into the focused field on every tick.
             if text != last_pasted:
@@ -1126,9 +1136,11 @@ def _do_live_stream():
             overlay_set_text(text)
 
     def _commit_final():
-        """Called after the user releases. Drains any tail audio, runs a
-        FINAL whisper pass, and either pastes the full text (batch) or
-        reconciles via diff (stream). Hides the overlay last."""
+        """Called after the user releases. In batch mode we want the
+        paste to feel instant: if the most recent preview already saw
+        essentially all the audio we captured, reuse its text instead
+        of paying ~1-2 s for another whisper pass on the same buffer.
+        Only retranscribe when meaningful new audio has come in since."""
         nonlocal last_preview, last_pasted
         # If the user hit Esc, drop everything: no transcribe, no paste,
         # no overlay revisions — just hide the HUD and bail.
@@ -1137,7 +1149,24 @@ def _do_live_stream():
             overlay_hide()
             return
         _ingest_audio()
-        text = _transcribe_buffer()
+        new_samples = len(voiced_buf) - state["preview_buf_samples"]
+        if (TYPER_MODE != "stream"
+                and last_preview
+                and new_samples < REUSE_PREVIEW_THRESHOLD_SAMPLES):
+            text = last_preview
+            log.info(
+                "commit-final: reusing preview (%.2fs new audio < %.2fs threshold)",
+                new_samples / SAMPLE_RATE,
+                REUSE_PREVIEW_THRESHOLD_SAMPLES / SAMPLE_RATE,
+            )
+        else:
+            t0 = time.time()
+            text = _transcribe_buffer()
+            log.info(
+                "commit-final: re-ran whisper (%.2fs new audio, %.0fms infer)",
+                max(0, new_samples) / SAMPLE_RATE,
+                (time.time() - t0) * 1000.0,
+            )
         if text is None:
             overlay_hide()
             return
