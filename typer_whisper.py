@@ -271,7 +271,7 @@ OVERLAY_USE_GLASS     = (
 # Whole-panel alpha applied on top of the vibrancy material. 1.0 = the
 # material's native opacity (still translucent thanks to blur); lower
 # values fade everything (background AND text) toward fully see-through.
-OVERLAY_ALPHA         = float(os.environ.get("TYPER_OVERLAY_ALPHA", "1.0"))
+OVERLAY_ALPHA         = float(os.environ.get("TYPER_OVERLAY_ALPHA", "0.92"))
 #   "caret"  — sit next to the focused text-input caret via macOS
 #              Accessibility API (best UX; requires AX permission).
 #   "cursor" — anchor to the mouse cursor position.
@@ -650,12 +650,12 @@ class _OverlayController(NSObject):
             except Exception:
                 pass
             bg.setCornerRadius_(OVERLAY_CORNER_RADIUS)
-            # Light off-white tint so the glass reads as a calm input
-            # surface instead of fully transparent. Slightly biased
-            # toward white because dark wallpapers would otherwise make
-            # the text label fight for contrast against neutral glass.
+            # Brighter white tint so the glass reads as a clearly-lit
+            # input surface (was 0.18; user feedback wanted it
+            # noticeably brighter). The text contrast against the
+            # tinted glass stays comfortable at 32% alpha.
             bg.setTintColor_(
-                NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.18)
+                NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.32)
             )
             bg.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             # NSGlassEffectView ships with no contentView by default —
