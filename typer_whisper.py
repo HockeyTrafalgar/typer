@@ -66,6 +66,7 @@ from AppKit import (
     NSImage, NSBezierPath, NSEdgeInsetsMake, NSImageResizingModeStretch,
     NSImageView, NSImageSymbolConfiguration, NSTextAlignmentCenter,
     NSFontAttributeName,
+    NSLineBreakByWordWrapping, NSStringDrawingUsesLineFragmentOrigin,
 )
 # Liquid Glass APIs — shipped in macOS 26 (Tahoe, WWDC '25). When
 # present we use NSGlassEffectView for proper refractive glass that
@@ -226,7 +227,10 @@ OVERLAY_ENABLED   = os.environ.get("TYPER_OVERLAY", "1") == "1"
 # Wide pill shape that scales with viewport in the CSS spec — we pick
 # a fixed pixel width that gives the same proportions on a 13–16" mac.
 OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "780"))
+# OVERLAY_H is the SINGLE-LINE height — the resting state. The panel
+# grows past this as the transcript wraps, capped at OVERLAY_MAX_H.
 OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "72"))
+OVERLAY_MAX_H        = int(os.environ.get("TYPER_OVERLAY_MAX_H", "320"))
 OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "22"))
 # Spotlight uses a fully-rounded pill (radius = H/2). Default to that.
 OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "36"))
@@ -726,12 +730,14 @@ class _OverlayController(NSObject):
         )
         self.label.setStringValue_("")
         cell = self.label.cell()
-        cell.setLineBreakMode_(NSLineBreakByTruncatingHead)
-        cell.setWraps_(False)
+        cell.setLineBreakMode_(NSLineBreakByWordWrapping)
+        cell.setWraps_(True)
+        cell.setUsesSingleLineMode_(False)
         cell.setScrollable_(False)
         content.addSubview_(self.label)
         self._text_x = text_x
         self._text_max_w = text_w
+        self._text_line_h = line_h
         # Caret was removed at the user's request — _reposition_caret
         # is a no-op now, but kept around so _render still calls
         # something without an AttributeError.
@@ -745,6 +751,19 @@ class _OverlayController(NSObject):
     def show_(self, status):
         """First display when a dictation session begins. The status
         string ('Listening…') is set as muted placeholder text."""
+        # Reset to single-line height BEFORE positioning. _position_near
+        # _cursor uses OVERLAY_H to compute the anchor point, but the
+        # panel may still be at the (taller) frame from a previous
+        # session. Without this reset, the panel snaps to the right
+        # X but is vertically misaligned relative to the caret.
+        cur = self.panel.frame()
+        if int(round(cur.size.height)) != OVERLAY_H:
+            top_y = cur.origin.y + cur.size.height
+            self.panel.setFrame_display_(
+                NSMakeRect(cur.origin.x, top_y - OVERLAY_H,
+                           cur.size.width, float(OVERLAY_H)),
+                False,
+            )
         self._position_near_cursor()
         self._current_text = ""
         self._render(status or "Listening…", placeholder=True)
@@ -788,6 +807,81 @@ class _OverlayController(NSObject):
             color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.80)
         self.label.setTextColor_(color)
         self.label.setStringValue_(text)
+        self._resize_to_fit(text)
+
+    @objc.python_method
+    def _measure_text_height(self, text):
+        """Wrap-aware height for `text` rendered into a column of width
+        self._text_max_w in the label's current font. Returns at least
+        one line's worth of height even for empty text."""
+        line_h = self._text_line_h
+        if not text:
+            return line_h
+        try:
+            attrs = {NSFontAttributeName: self.label.font()}
+            s = objc.lookUpClass("NSString").stringWithString_(text)
+            rect = s.boundingRectWithSize_options_attributes_(
+                NSMakeSize(self._text_max_w, 1.0e6),
+                NSStringDrawingUsesLineFragmentOrigin,
+                attrs,
+            )
+            # Round up so we never under-allocate by a sub-pixel.
+            return max(line_h, float(rect.size.height) + 1.0)
+        except Exception:
+            log.debug("text measure failed", exc_info=True)
+            return line_h
+
+    @objc.python_method
+    def _resize_to_fit(self, text):
+        """Grow the panel vertically to fit the wrapped text. Stays at
+        OVERLAY_H for single-line content, expands up to OVERLAY_MAX_H
+        as the transcript wraps to more lines. The panel's TOP edge is
+        the anchor — growth happens downward so the caret-anchored
+        position above the focused input stays stable."""
+        line_h = self._text_line_h
+        # Vertical padding on either side of the first line (used to
+        # vertically center the resting single-line state).
+        top_pad = (OVERLAY_H - line_h) / 2.0
+        bot_pad = top_pad
+
+        measured_h = self._measure_text_height(text)
+        needed = top_pad + measured_h + bot_pad
+        new_h = int(round(max(float(OVERLAY_H), min(float(OVERLAY_MAX_H), needed))))
+
+        old_frame = self.panel.frame()
+        old_top_y = old_frame.origin.y + old_frame.size.height
+        if int(round(old_frame.size.height)) != new_h:
+            new_frame = NSMakeRect(
+                old_frame.origin.x, old_top_y - new_h,
+                old_frame.size.width, float(new_h),
+            )
+            # No animate=True — text updates land every ~0.35 s, and
+            # animating each one creates visible churn. Instant resize
+            # reads as the panel growing naturally with the content.
+            self.panel.setFrame_display_(new_frame, True)
+
+        # Anchor mic icon to the FIRST line so it doesn't drift down
+        # the panel as the transcript grows.
+        if self._mic is not None:
+            mic_frame = self._mic.frame()
+            mic_h = mic_frame.size.height
+            mic_top_pad = (OVERLAY_H - mic_h) / 2.0
+            self._mic.setFrame_(NSMakeRect(
+                mic_frame.origin.x,
+                new_h - mic_top_pad - mic_h,
+                mic_frame.size.width, mic_h,
+            ))
+
+        # Resize the label to span from top-pad to bottom-pad. Text
+        # starts at the top of the frame and wraps downward, so the
+        # frame's TOP must align with where the first line lives.
+        label_h = max(line_h, new_h - top_pad - bot_pad)
+        self.label.setFrame_(NSMakeRect(
+            self._text_x,
+            bot_pad,
+            self._text_max_w,
+            label_h,
+        ))
 
     @objc.python_method
     def _position_near_cursor(self):
