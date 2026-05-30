@@ -211,8 +211,8 @@ OVERLAY_ENABLED   = os.environ.get("TYPER_OVERLAY", "1") == "1"
 # input — slim height, wide enough for ~70 chars before head-truncation
 # kicks in, very rounded corners that approach pill-shaped without
 # becoming a circle when text is short.
-OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "640"))
-OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "52"))
+OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "560"))
+OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "48"))
 OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "15"))
 # Generous radius — the design language is "floating soft pill", not
 # "HUD card". Cap below H/2 so we never collapse into a true circle.
@@ -618,46 +618,50 @@ class _OverlayController(NSObject):
         self._bg = ve
 
         # ── Recording indicator (red dot with glowing halo) ────────────
-        # Two-layer construction: a soft red halo sized larger than the
-        # solid inner dot, with the halo's opacity pulsing for the
-        # "breathing" effect. Halo is the visual weight; the dot is
-        # crisp and constant.
-        halo_size = 18.0
-        dot_size = 8.0
-        halo_x = OVERLAY_PAD_X
-        halo_y = (OVERLAY_H - halo_size) / 2.0
-        halo = NSView.alloc().initWithFrame_(
-            NSMakeRect(halo_x, halo_y, halo_size, halo_size)
+        # CRITICAL: halo and dot are SIBLINGS, not parent/child. The
+        # previous build nested the dot inside the halo and pulsed the
+        # halo's opacity, which cascaded to the dot and made the whole
+        # indicator wash out at the low end of the cycle. Siblings keep
+        # the solid dot anchored at full saturation while only the halo
+        # breathes.
+        dot_size = 9.0
+        halo_size = 19.0
+        center_y = OVERLAY_H / 2.0
+        center_x = OVERLAY_PAD_X + halo_size / 2.0
+        red = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            0.96, 0.28, 0.20, 1.0
         )
+
+        halo = NSView.alloc().initWithFrame_(NSMakeRect(
+            center_x - halo_size / 2.0, center_y - halo_size / 2.0,
+            halo_size, halo_size
+        ))
         halo.setWantsLayer_(True)
-        halo_layer = halo.layer()
-        halo_layer.setCornerRadius_(halo_size / 2.0)
-        # Warm red-orange matching modern macOS recording UIs.
-        halo_layer.setBackgroundColor_(
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.95, 0.28, 0.20, 0.28).CGColor()
+        halo.layer().setCornerRadius_(halo_size / 2.0)
+        halo.layer().setBackgroundColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.96, 0.28, 0.20, 0.22
+            ).CGColor()
         )
-        # Halo gently breathes.
         breathe = CABasicAnimation.animationWithKeyPath_("opacity")
         breathe.setFromValue_(1.0)
-        breathe.setToValue_(0.4)
+        breathe.setToValue_(0.35)
         breathe.setDuration_(0.9)
         breathe.setAutoreverses_(True)
         breathe.setRepeatCount_(1e9)
-        halo_layer.addAnimation_forKey_(breathe, "breathe")
-
-        dot_offset = (halo_size - dot_size) / 2.0
-        dot = NSView.alloc().initWithFrame_(
-            NSMakeRect(dot_offset, dot_offset, dot_size, dot_size)
-        )
-        dot.setWantsLayer_(True)
-        dot_layer = dot.layer()
-        dot_layer.setCornerRadius_(dot_size / 2.0)
-        dot_layer.setBackgroundColor_(
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.95, 0.28, 0.20, 1.0).CGColor()
-        )
-        halo.addSubview_(dot)
+        halo.layer().addAnimation_forKey_(breathe, "breathe")
         ve.addSubview_(halo)
-        self._dot = halo
+
+        dot = NSView.alloc().initWithFrame_(NSMakeRect(
+            center_x - dot_size / 2.0, center_y - dot_size / 2.0,
+            dot_size, dot_size
+        ))
+        dot.setWantsLayer_(True)
+        dot.layer().setCornerRadius_(dot_size / 2.0)
+        dot.layer().setBackgroundColor_(red.CGColor())
+        ve.addSubview_(dot)
+        self._dot = dot
+        self._halo = halo
 
         # ── Right cluster: mic icon | esc pill | separator ─────────────
         # Lay these out from the right edge inward so the text label can
@@ -749,11 +753,15 @@ class _OverlayController(NSObject):
         self._sep = sep
 
         # ── Transcript label ───────────────────────────────────────────
-        text_x = halo_x + halo_size + 10.0
+        # NSTextField doesn't vertically center its text inside its
+        # frame; we approximate centering by sizing the frame to the
+        # font's natural line height and placing it at the row center.
+        text_x = OVERLAY_PAD_X + halo_size + 10.0
         text_w = sep_x - text_x - 8.0
-        text_h = OVERLAY_H - 2 * OVERLAY_PAD_Y
+        line_h = OVERLAY_FONT_SIZE * 1.35  # safe enough for SF Pro
+        text_y = (OVERLAY_H - line_h) / 2.0
         self.label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(text_x, OVERLAY_PAD_Y, text_w, text_h)
+            NSMakeRect(text_x, text_y, text_w, line_h)
         )
         self.label.setEditable_(False)
         self.label.setSelectable_(False)
@@ -773,11 +781,11 @@ class _OverlayController(NSObject):
         self._text_max_w = text_w
 
         # ── Blinking insertion caret ───────────────────────────────────
-        # Thin black bar that sits at the right edge of whatever text is
-        # currently displayed. Hard on/off blink via key-frame timing
-        # (smooth fades don't read as a real text caret).
-        caret_w = 1.6
-        caret_h = OVERLAY_FONT_SIZE + 4
+        # Sized to match the label's cap height so it reads as a real
+        # text caret. Hard on/off via keyframe timing (a smooth fade
+        # looks like UI breath, not a cursor).
+        caret_w = 1.8
+        caret_h = OVERLAY_FONT_SIZE + 2
         caret_y = (OVERLAY_H - caret_h) / 2.0
         caret = NSView.alloc().initWithFrame_(
             NSMakeRect(text_x, caret_y, caret_w, caret_h)
