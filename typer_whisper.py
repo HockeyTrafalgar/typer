@@ -50,11 +50,21 @@ from silero_vad import load_silero_vad
 import objc
 from AppKit import (
     NSApplication, NSApp, NSPanel, NSScreen, NSEvent, NSColor, NSFont,
-    NSTextField, NSMakeRect, NSMakePoint,
+    NSTextField, NSView, NSMakeRect, NSMakePoint, NSMakeSize,
     NSBackingStoreBuffered, NSFloatingWindowLevel,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorStationary,
     NSWindowCollectionBehaviorIgnoresCycle,
+    NSVisualEffectView,
+    NSVisualEffectMaterialHUDWindow,
+    NSVisualEffectBlendingModeBehindWindow,
+    NSVisualEffectStateActive,
+    NSFontWeightMedium, NSFontWeightSemibold,
+    NSLineBreakByTruncatingHead,
+    NSViewWidthSizable, NSViewHeightSizable,
+)
+from Quartz import (
+    CABasicAnimation, kCACornerCurveContinuous,
 )
 from Foundation import NSObject
 from PyObjCTools import AppHelper
@@ -186,15 +196,23 @@ VAD_RMS_FLOOR = float(os.environ.get("TYPER_VAD_RMS_FLOOR", "0.005"))
 # Floating HUD that previews the live transcript next to the mouse
 # cursor. Updates every push interval via main-thread dispatch.
 OVERLAY_ENABLED   = os.environ.get("TYPER_OVERLAY", "1") == "1"
-OVERLAY_W         = int(os.environ.get("TYPER_OVERLAY_W", "640"))
-OVERLAY_H         = int(os.environ.get("TYPER_OVERLAY_H", "72"))
-OVERLAY_FONT_SIZE = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "18"))
+# Default dimensions tuned to a single line of body text at the modern
+# macOS HUD size (16pt SF Pro Medium). Width is roomy enough for ~70
+# chars before head-truncation kicks in; height matches the system
+# HUD's ~56pt feel.
+OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "560"))
+OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "56"))
+OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "15"))
+# Continuous corner radius. macOS HUD windows use ~14-18pt; we sit
+# in the middle for an unmistakably modern look.
+OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "16"))
+OVERLAY_PAD_X         = float(os.environ.get("TYPER_OVERLAY_PAD_X", "18"))
+OVERLAY_PAD_Y         = float(os.environ.get("TYPER_OVERLAY_PAD_Y", "12"))
 #   "caret"  — sit next to the focused text-input caret via macOS
 #              Accessibility API (best UX; requires AX permission).
 #   "cursor" — anchor to the mouse cursor position.
 #   "bottom" — centered at the bottom of the active screen.
 OVERLAY_PLACEMENT = os.environ.get("TYPER_OVERLAY_PLACEMENT", "caret")
-OVERLAY_BG_ALPHA  = float(os.environ.get("TYPER_OVERLAY_BG_ALPHA", "0.78"))
 
 # ── LOGGING ──────────────────────────────────────────────────────────────────
 LOG_DIR = Path(os.environ.get("TYPER_LOG_DIR", Path(__file__).resolve().parent / "logs"))
@@ -502,6 +520,11 @@ class _OverlayController(NSObject):
         self = objc.super(_OverlayController, self).init()
         if self is None:
             return None
+        # ── Panel ──────────────────────────────────────────────────────
+        # Transparent, borderless, non-activating. The visible chrome
+        # comes entirely from the NSVisualEffectView below — that's the
+        # macOS HIG way to get system-blurred, dark/light-mode-aware
+        # backgrounds that look right on any wallpaper.
         rect = NSMakeRect(0, 0, OVERLAY_W, OVERLAY_H)
         style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -509,9 +532,7 @@ class _OverlayController(NSObject):
         )
         self.panel.setLevel_(NSFloatingWindowLevel)
         self.panel.setOpaque_(False)
-        self.panel.setBackgroundColor_(
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, OVERLAY_BG_ALPHA)
-        )
+        self.panel.setBackgroundColor_(NSColor.clearColor())
         self.panel.setHasShadow_(True)
         self.panel.setBecomesKeyOnlyIfNeeded_(True)
         self.panel.setHidesOnDeactivate_(False)
@@ -521,19 +542,80 @@ class _OverlayController(NSObject):
             | NSWindowCollectionBehaviorStationary
             | NSWindowCollectionBehaviorIgnoresCycle
         )
-        # Text label inside the panel.
-        pad = 12
+
+        # ── Vibrancy background ────────────────────────────────────────
+        # HUDWindow material is what macOS uses for its own volume /
+        # brightness HUDs — very dark with strong blur. Continuous
+        # corner curve (vs the older quarter-circle) is the modern
+        # iOS/macOS rounding style introduced with the SwiftUI era.
+        ve = NSVisualEffectView.alloc().initWithFrame_(rect)
+        ve.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        ve.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        ve.setState_(NSVisualEffectStateActive)
+        ve.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        ve.setWantsLayer_(True)
+        layer = ve.layer()
+        layer.setCornerRadius_(OVERLAY_CORNER_RADIUS)
+        try:
+            layer.setCornerCurve_(kCACornerCurveContinuous)
+        except Exception:
+            pass  # pre-10.15 fallback — never happens on supported macOS
+        layer.setMasksToBounds_(True)
+        self.panel.setContentView_(ve)
+        self._bg = ve
+
+        # ── Recording indicator (red pulsing dot) ──────────────────────
+        # Matches the visual language of macOS's own screen-recording
+        # menu-bar dot and Voice Memos: small, red, gently pulsing.
+        dot_size = 10.0
+        dot_x = OVERLAY_PAD_X
+        dot_y = (OVERLAY_H - dot_size) / 2.0
+        dot_view = NSView.alloc().initWithFrame_(
+            NSMakeRect(dot_x, dot_y, dot_size, dot_size)
+        )
+        dot_view.setWantsLayer_(True)
+        dot_layer = dot_view.layer()
+        dot_layer.setCornerRadius_(dot_size / 2.0)
+        dot_layer.setBackgroundColor_(NSColor.systemRedColor().CGColor())
+        # Gentle opacity pulse, ~1.4 s period. setAutoreverses doubles
+        # that to give a smooth in-out breath.
+        pulse = CABasicAnimation.animationWithKeyPath_("opacity")
+        pulse.setFromValue_(1.0)
+        pulse.setToValue_(0.35)
+        pulse.setDuration_(0.7)
+        pulse.setAutoreverses_(True)
+        pulse.setRepeatCount_(1e9)
+        dot_layer.addAnimation_forKey_(pulse, "pulse")
+        ve.addSubview_(dot_view)
+        self._dot = dot_view
+
+        # ── Transcript label ───────────────────────────────────────────
+        # SF Pro at the system "body" size, medium weight — readable at
+        # a glance without shouting. Color uses semantic label colors so
+        # it adapts automatically to dark/light appearance.
+        text_x = dot_x + dot_size + OVERLAY_PAD_X * 0.9
+        text_w = OVERLAY_W - text_x - OVERLAY_PAD_X
+        text_h = OVERLAY_H - 2 * OVERLAY_PAD_Y
         self.label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(pad, pad, OVERLAY_W - 2 * pad, OVERLAY_H - 2 * pad)
+            NSMakeRect(text_x, OVERLAY_PAD_Y, text_w, text_h)
         )
         self.label.setEditable_(False)
         self.label.setSelectable_(False)
         self.label.setBezeled_(False)
         self.label.setDrawsBackground_(False)
-        self.label.setFont_(NSFont.systemFontOfSize_(OVERLAY_FONT_SIZE))
-        self.label.setTextColor_(NSColor.whiteColor())
+        self.label.setFont_(
+            NSFont.systemFontOfSize_weight_(OVERLAY_FONT_SIZE, NSFontWeightMedium)
+        )
+        # labelColor adapts: black-ish on light, white-ish on dark.
+        self.label.setTextColor_(NSColor.labelColor())
         self.label.setStringValue_("")
-        self.panel.contentView().addSubview_(self.label)
+        # Truncate from the head so the most recent words stay visible
+        # when the transcript grows longer than the overlay can show.
+        cell = self.label.cell()
+        cell.setLineBreakMode_(NSLineBreakByTruncatingHead)
+        cell.setWraps_(False)
+        cell.setScrollable_(False)
+        ve.addSubview_(self.label)
         return self
 
     # ── main-thread entry points (called via performSelectorOnMainThread_) ──
@@ -541,7 +623,7 @@ class _OverlayController(NSObject):
         """status: short header like '🎤 listening…' shown above the
         transcript on first display."""
         self._position_near_cursor()
-        self.label.setStringValue_(status or "🎤 listening…")
+        self.label.setStringValue_(status or "Listening…")
         self.panel.orderFrontRegardless()
 
     def hide_(self, _ignored):
@@ -550,7 +632,7 @@ class _OverlayController(NSObject):
     def setText_(self, text):
         # Empty text → show the listening placeholder so the user isn't
         # left staring at a blank box while waiting for the first tick.
-        self.label.setStringValue_(text or "🎤 listening…")
+        self.label.setStringValue_(text or "Listening…")
 
     def _position_near_cursor(self):
         screen = NSScreen.mainScreen()
@@ -782,7 +864,7 @@ def _do_live_stream():
                  WHISPER_TEMPERATURE, WHISPER_BEST_OF,
                  WHISPER_CONDITION_ON_PREV, WHISPER_LANGUAGE or "auto",
                  _WHISPER_HALLUCINATION_SILENCE_PARSED, WHISPER_INITIAL_PROMPT)
-        overlay_show("🎤 listening…")
+        overlay_show("Listening…")
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
