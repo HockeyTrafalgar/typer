@@ -650,25 +650,19 @@ class _OverlayController(NSObject):
         # init() so the subview construction below is identical.
         if OVERLAY_USE_GLASS:
             bg = NSGlassEffectView.alloc().initWithFrame_(rect)
-            # "Clear" style is the more transparent of the two Liquid
-            # Glass presets — lets more of the wallpaper / window
-            # behind the HUD through. Fall through to Regular if it's
-            # unavailable on this build.
+            # Regular style is Apple's everyday Liquid Glass material —
+            # already light and refractive on its own. Clear was making
+            # the panel read DARKER as we added white tint (the tint
+            # interacts oddly with the Clear style's compositing).
             try:
-                bg.setStyle_(NSGlassEffectViewStyleClear)
+                bg.setStyle_(NSGlassEffectViewStyleRegular)
             except Exception:
-                try:
-                    bg.setStyle_(NSGlassEffectViewStyleRegular)
-                except Exception:
-                    pass
+                pass
             bg.setCornerRadius_(OVERLAY_CORNER_RADIUS)
-            # Very light white tint to preserve some contrast against
-            # busy/dark wallpapers without painting over the
-            # refraction. Drop to clearColor for the most see-through
-            # look (text legibility can suffer on dark wallpapers).
-            bg.setTintColor_(
-                NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.45)
-            )
+            # No tint — let the Regular material show through at its
+            # native brightness. If we ever want to bias the surface
+            # toward a particular hue, set a near-clearColor here.
+            bg.setTintColor_(NSColor.clearColor())
             bg.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             # NSGlassEffectView ships with no contentView by default —
             # we must install one explicitly. All our subviews (dot,
