@@ -1026,9 +1026,17 @@ def _do_live_stream():
             # Overlay shows it briefly so the user can confirm before it
             # disappears. We hide AFTER the paste so a slow paste doesn't
             # leave a stale-looking overlay.
+            #
+            # Append a trailing space so two back-to-back dictation
+            # sessions don't stick together (e.g. "hello there" then
+            # "how are you" would otherwise paste as
+            # "hello therehow are you"). Strip first to avoid
+            # double-spacing if whisper already produced a trailing
+            # space, then add exactly one.
+            payload = text.rstrip() + " "
             overlay_set_text(text)
-            _paste_text(text)
-            last_pasted = text
+            _paste_text(payload)
+            last_pasted = payload
         overlay_hide()
 
     t_start = time.time()
