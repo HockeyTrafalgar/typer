@@ -43,6 +43,28 @@ from pynput import keyboard
 import mlx_whisper
 from silero_vad import load_silero_vad
 
+# AppKit (PyObjC) drives the live-transcription overlay HUD. NSPanel with
+# becomesKeyOnlyIfNeeded + nonactivating behavior is the only way to get a
+# floating window on macOS that NEVER steals focus from the user's app —
+# critical here since we're synthesizing keystrokes into that app.
+import objc
+from AppKit import (
+    NSApplication, NSApp, NSPanel, NSScreen, NSEvent, NSColor, NSFont,
+    NSTextField, NSMakeRect, NSMakePoint,
+    NSBackingStoreBuffered, NSFloatingWindowLevel,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorStationary,
+    NSWindowCollectionBehaviorIgnoresCycle,
+)
+from Foundation import NSObject
+from PyObjCTools import AppHelper
+
+# NSPanel-only style mask that gives us a borderless, non-activating HUD.
+# AppKit doesn't always re-export this constant by name in PyObjC, so we
+# define it manually (NSWindowStyleMaskNonactivatingPanel = 1<<7).
+NSWindowStyleMaskNonactivatingPanel = 1 << 7
+NSWindowStyleMaskBorderless = 0
+
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 # Best available Whisper on MLX. Use "mlx-community/whisper-large-v3-turbo"
 # for ~2-3× faster inference at slightly lower accuracy, or
@@ -50,9 +72,20 @@ from silero_vad import load_silero_vad
 MODEL_ID = os.environ.get("TYPER_MODEL", "mlx-community/whisper-large-v3-mlx")
 SAMPLE_RATE = 16000
 
-# How often to re-transcribe the growing buffer + paste the new suffix.
-# Whisper is not natively streaming, so each tick re-runs the model on the
-# full voiced audio captured so far. Larger = fewer revisions, more latency.
+# Typing mode:
+#   "batch"  — accumulate audio while held, transcribe once on release,
+#              paste the full final text in one shot. No diff churn, no
+#              backspaces, no risk of partial pastes landing in the wrong
+#              window. Live transcription still runs every push interval
+#              and updates the floating overlay so you see what's coming.
+#   "stream" — legacy behavior: re-transcribe every push interval and
+#              diff-paste the new suffix directly into the focused field.
+TYPER_MODE = os.environ.get("TYPER_MODE", "batch").lower()
+
+# How often to re-transcribe for the overlay preview (batch mode) or for
+# the diff-paste tick (stream mode). Whisper is not natively streaming,
+# so each tick re-runs the model on the full voiced audio captured so
+# far. Larger = lower CPU/GPU load, more lag in the overlay preview.
 LIVE_PUSH_INTERVAL_S = float(os.environ.get("TYPER_PUSH_S", "1.0"))
 
 # Optional explicit language code (e.g. "en", "ru"). Empty = auto-detect
@@ -132,6 +165,16 @@ VAD_HANGOVER_MS = int(os.environ.get("TYPER_VAD_HANGOVER_MS", "400"))
 # and quiet speech onsets get gated out before Silero ever sees them.
 # 0.005 keeps room ambience out but admits soft speech.
 VAD_RMS_FLOOR = float(os.environ.get("TYPER_VAD_RMS_FLOOR", "0.005"))
+
+# ── OVERLAY CONFIG ──────────────────────────────────────────────────────────
+# Floating HUD that previews the live transcript next to the mouse
+# cursor. Updates every push interval via main-thread dispatch.
+OVERLAY_ENABLED   = os.environ.get("TYPER_OVERLAY", "1") == "1"
+OVERLAY_W         = int(os.environ.get("TYPER_OVERLAY_W", "640"))
+OVERLAY_H         = int(os.environ.get("TYPER_OVERLAY_H", "72"))
+OVERLAY_FONT_SIZE = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "18"))
+OVERLAY_PLACEMENT = os.environ.get("TYPER_OVERLAY_PLACEMENT", "cursor")  # "cursor" | "bottom"
+OVERLAY_BG_ALPHA  = float(os.environ.get("TYPER_OVERLAY_BG_ALPHA", "0.78"))
 
 # ── LOGGING ──────────────────────────────────────────────────────────────────
 LOG_DIR = Path(os.environ.get("TYPER_LOG_DIR", Path(__file__).resolve().parent / "logs"))
@@ -358,6 +401,116 @@ def _get_vad_model():
         return vad_model
 
 
+# ── OVERLAY (floating HUD) ───────────────────────────────────────────────────
+class _OverlayController(NSObject):
+    """Owns a non-activating NSPanel that floats above all windows and
+    shows the live transcript. Methods are invoked via
+    performSelectorOnMainThread_ from any worker thread so AppKit calls
+    always land on the main run loop, which is the only thread that may
+    mutate the view hierarchy safely.
+
+    NSWindowStyleMaskNonactivatingPanel + becomesKeyOnlyIfNeeded ensures
+    the user's currently-focused app NEVER loses key-window status when
+    we show/hide/move the panel — critical because we're synthesizing
+    keystrokes into that app.
+    """
+
+    def init(self):
+        self = objc.super(_OverlayController, self).init()
+        if self is None:
+            return None
+        rect = NSMakeRect(0, 0, OVERLAY_W, OVERLAY_H)
+        style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect, style, NSBackingStoreBuffered, False
+        )
+        self.panel.setLevel_(NSFloatingWindowLevel)
+        self.panel.setOpaque_(False)
+        self.panel.setBackgroundColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.0, 0.0, OVERLAY_BG_ALPHA)
+        )
+        self.panel.setHasShadow_(True)
+        self.panel.setBecomesKeyOnlyIfNeeded_(True)
+        self.panel.setHidesOnDeactivate_(False)
+        self.panel.setIgnoresMouseEvents_(True)
+        self.panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorIgnoresCycle
+        )
+        # Text label inside the panel.
+        pad = 12
+        self.label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(pad, pad, OVERLAY_W - 2 * pad, OVERLAY_H - 2 * pad)
+        )
+        self.label.setEditable_(False)
+        self.label.setSelectable_(False)
+        self.label.setBezeled_(False)
+        self.label.setDrawsBackground_(False)
+        self.label.setFont_(NSFont.systemFontOfSize_(OVERLAY_FONT_SIZE))
+        self.label.setTextColor_(NSColor.whiteColor())
+        self.label.setStringValue_("")
+        self.panel.contentView().addSubview_(self.label)
+        return self
+
+    # ── main-thread entry points (called via performSelectorOnMainThread_) ──
+    def show_(self, status):
+        """status: short header like '🎤 listening…' shown above the
+        transcript on first display."""
+        self._position_near_cursor()
+        self.label.setStringValue_(status or "🎤 listening…")
+        self.panel.orderFrontRegardless()
+
+    def hide_(self, _ignored):
+        self.panel.orderOut_(None)
+
+    def setText_(self, text):
+        # Empty text → show the listening placeholder so the user isn't
+        # left staring at a blank box while waiting for the first tick.
+        self.label.setStringValue_(text or "🎤 listening…")
+
+    def _position_near_cursor(self):
+        loc = NSEvent.mouseLocation()  # screen coords, origin bottom-left
+        screen = NSScreen.mainScreen()
+        if OVERLAY_PLACEMENT == "bottom" or screen is None:
+            vf = (screen or NSScreen.screens()[0]).visibleFrame()
+            x = vf.origin.x + (vf.size.width - OVERLAY_W) / 2
+            y = vf.origin.y + 40
+        else:
+            vf = screen.visibleFrame()
+            # Offset slightly down-right from the cursor so we don't sit
+            # under it (which would block the user's view of what they're
+            # about to click). Flip sides if we'd run off the screen.
+            x = loc.x + 18
+            y = loc.y - OVERLAY_H - 18
+            if x + OVERLAY_W > vf.origin.x + vf.size.width:
+                x = loc.x - OVERLAY_W - 18
+            if y < vf.origin.y:
+                y = loc.y + 18
+        self.panel.setFrameOrigin_(NSMakePoint(x, y))
+
+
+_overlay_controller = None  # set in main() on the main thread
+
+def _overlay_call(selector, arg=None):
+    """Dispatch an overlay method to the main run loop. Safe to call
+    from any thread; returns immediately (waitUntilDone=False)."""
+    if _overlay_controller is None or not OVERLAY_ENABLED:
+        return
+    _overlay_controller.performSelectorOnMainThread_withObject_waitUntilDone_(
+        selector, arg, False
+    )
+
+def overlay_show(status=None):
+    _overlay_call("show:", status)
+
+def overlay_hide():
+    _overlay_call("hide:", None)
+
+def overlay_set_text(text):
+    _overlay_call("setText:", text or "")
+
+
 # ── LIVE STREAMING ────────────────────────────────────────────────────────────
 def _paste_text(text):
     if not text:
@@ -418,57 +571,107 @@ def _do_live_stream():
     except Exception:
         log.exception("VAD init failed, falling back to raw audio (hallucinations possible)")
 
-    last_pasted = ""
+    last_pasted = ""       # only used in stream mode (diff state)
+    last_preview = ""      # what's currently shown in the overlay
     iters = 0
     max_buf_samples = int(MAX_BUFFER_S * SAMPLE_RATE)
     voiced_buf = np.zeros(0, dtype=np.float32)
 
-    def _drain_and_emit():
-        nonlocal last_pasted, voiced_buf
+    def _ingest_audio():
+        """Drain the audio queue into voiced_buf (with VAD gating).
+        Returns True if any new voiced audio was added this call."""
+        nonlocal voiced_buf
         buf = []
         while True:
             try:
                 buf.append(audio_q.get_nowait())
             except queue.Empty:
                 break
-        if buf:
-            samples = np.concatenate(buf)
-            raw_n = len(samples)
-            if gate is not None:
-                samples = gate.process(samples)
-            if len(samples):
-                log.debug("drain: raw=%d voiced=%d (%.2fs voiced)",
-                          raw_n, len(samples), len(samples) / SAMPLE_RATE)
-                voiced_buf = np.concatenate([voiced_buf, samples])
-                if len(voiced_buf) > max_buf_samples:
-                    # Drop the oldest audio so Whisper's 30s window doesn't
-                    # start sliding mid-utterance. The already-pasted text
-                    # before the cut won't be revisited by future diffs.
-                    drop = len(voiced_buf) - max_buf_samples
-                    log.debug("buffer cap hit, dropping %d oldest samples", drop)
-                    voiced_buf = voiced_buf[drop:]
+        if not buf:
+            return False
+        samples = np.concatenate(buf)
+        raw_n = len(samples)
+        if gate is not None:
+            samples = gate.process(samples)
+        if not len(samples):
+            return False
+        log.debug("drain: raw=%d voiced=%d (%.2fs voiced)",
+                  raw_n, len(samples), len(samples) / SAMPLE_RATE)
+        voiced_buf = np.concatenate([voiced_buf, samples])
+        if len(voiced_buf) > max_buf_samples:
+            drop = len(voiced_buf) - max_buf_samples
+            log.debug("buffer cap hit, dropping %d oldest samples", drop)
+            voiced_buf = voiced_buf[drop:]
+        return True
+
+    def _transcribe_buffer():
+        """Run Whisper on the current voiced_buf. Returns the text, or
+        None if the buffer is too short / inference failed."""
         if len(voiced_buf) < SAMPLE_RATE // 4:  # < 0.25s — not worth a call
-            return
+            return None
         t_infer = time.time()
         try:
-            current = _whisper_transcribe(voiced_buf)
+            text = _whisper_transcribe(voiced_buf)
         except Exception:
             log.exception("whisper transcribe failed this tick")
-            return
+            return None
         infer_ms = (time.time() - t_infer) * 1000.0
         log.debug("whisper tick: buf=%.2fs infer=%.0fms text=%r",
-                  len(voiced_buf) / SAMPLE_RATE, infer_ms, current)
-        if current != last_pasted:
-            last_pasted = _emit_diff(current, last_pasted)
+                  len(voiced_buf) / SAMPLE_RATE, infer_ms, text)
+        return text
+
+    def _tick_preview():
+        """Per-interval tick during recording. Ingests audio, runs a
+        whisper preview, and updates the overlay only. NEVER touches the
+        user's input field — that happens once on release in batch mode,
+        or via the legacy diff path in stream mode."""
+        nonlocal last_preview, last_pasted
+        _ingest_audio()
+        text = _transcribe_buffer()
+        if text is None:
+            return
+        if TYPER_MODE == "stream":
+            # Legacy: diff-paste into the focused field on every tick.
+            if text != last_pasted:
+                last_pasted = _emit_diff(text, last_pasted)
+            return
+        # batch mode: update overlay only.
+        if text != last_preview:
+            last_preview = text
+            overlay_set_text(text)
+
+    def _commit_final():
+        """Called after the user releases. Drains any tail audio, runs a
+        FINAL whisper pass, and either pastes the full text (batch) or
+        reconciles via diff (stream). Hides the overlay last."""
+        nonlocal last_preview, last_pasted
+        _ingest_audio()
+        text = _transcribe_buffer()
+        if text is None:
+            overlay_hide()
+            return
+        if TYPER_MODE == "stream":
+            if text != last_pasted:
+                last_pasted = _emit_diff(text, last_pasted)
+        else:
+            # batch mode: paste the entire final transcript in one shot.
+            # Overlay shows it briefly so the user can confirm before it
+            # disappears. We hide AFTER the paste so a slow paste doesn't
+            # leave a stale-looking overlay.
+            overlay_set_text(text)
+            _paste_text(text)
+            last_pasted = text
+        overlay_hide()
 
     t_start = time.time()
     try:
-        log.info("stream cfg: model=%s push=%.2fs beam=%d temp=%s best_of=%d "
-                 "cond_prev=%s lang=%s halluc_silence=%s prompt=%r",
-                 MODEL_ID, LIVE_PUSH_INTERVAL_S, WHISPER_BEAM_SIZE,
+        log.info("stream cfg: mode=%s model=%s push=%.2fs beam=%d temp=%s "
+                 "best_of=%d cond_prev=%s lang=%s halluc_silence=%s prompt=%r",
+                 TYPER_MODE, MODEL_ID, LIVE_PUSH_INTERVAL_S, WHISPER_BEAM_SIZE,
                  WHISPER_TEMPERATURE, WHISPER_BEST_OF,
                  WHISPER_CONDITION_ON_PREV, WHISPER_LANGUAGE or "auto",
                  _WHISPER_HALLUCINATION_SILENCE_PARSED, WHISPER_INITIAL_PROMPT)
+        overlay_show("🎤 listening…")
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
@@ -478,22 +681,27 @@ def _do_live_stream():
         ):
             log.debug("audio input opened sr=%d", SAMPLE_RATE)
             while not live_stop_event.is_set():
-                time.sleep(LIVE_PUSH_INTERVAL_S)
+                # wait() returns immediately when the user releases, instead
+                # of finishing the full LIVE_PUSH_INTERVAL_S sleep — keeps
+                # the final whisper pass close to the release event.
+                if live_stop_event.wait(LIVE_PUSH_INTERVAL_S):
+                    break
                 iters += 1
                 t_tick = time.time()
-                _drain_and_emit()
+                _tick_preview()
                 tick_ms = (time.time() - t_tick) * 1000.0
                 try:
                     active_mb = mx.get_active_memory() / (1024 * 1024)
                     peak_mb = mx.get_peak_memory() / (1024 * 1024)
-                    log.debug("tick %d: drain+infer=%.0fms mlx_active=%.0fMB peak=%.0fMB",
+                    log.debug("tick %d: preview=%.0fms mlx_active=%.0fMB peak=%.0fMB",
                               iters, tick_ms, active_mb, peak_mb)
                 except Exception:
-                    log.debug("tick %d: drain+infer=%.0fms", iters, tick_ms)
-            log.debug("final flush after %d iters", iters)
-            _drain_and_emit()
+                    log.debug("tick %d: preview=%.0fms", iters, tick_ms)
+            log.debug("commit-final after %d iters", iters)
+            _commit_final()
     except Exception:
         log.exception("stream error")
+        overlay_hide()
     finally:
         vad_stats = gate.stats if gate else {}
         if gate:
@@ -589,16 +797,43 @@ def main():
     if not model_ok:
         log.critical("model load failed — exiting")
         sys.exit(1)
-    log.info("🟢 ready. Hold Right-⌘ to talk, or tap F19 to toggle.")
+    log.info("🟢 ready (mode=%s). Hold Right-⌘ to talk, or tap F19 to toggle.",
+             TYPER_MODE)
 
     def _cleanup():
         log.info("cleanup")
         if live_active:
             stop_live_dictation()
+        overlay_hide()
     atexit.register(_cleanup)
     signal.signal(signal.SIGTERM, lambda *a: (log.info("SIGTERM"), _cleanup(), sys.exit(0)))
 
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+    # The keyboard.Listener spawns its own Quartz event-tap thread, so we
+    # can start it and leave the main thread free to run AppKit's run
+    # loop — which is required for the floating overlay panel. Updates
+    # are marshalled onto this main loop via performSelectorOnMainThread_.
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+
+    global _overlay_controller
+    if OVERLAY_ENABLED:
+        # NSApplication must be initialized on the main thread before any
+        # AppKit objects are created. The controller's window is built in
+        # init(), so it lives on the main thread from birth.
+        NSApplication.sharedApplication()
+        _overlay_controller = _OverlayController.alloc().init()
+        log.info("overlay initialized (%dx%d, placement=%s)",
+                 OVERLAY_W, OVERLAY_H, OVERLAY_PLACEMENT)
+        try:
+            # AppHelper installs SIGINT handling so Ctrl+C cleanly stops
+            # the run loop instead of leaving us wedged in CFRunLoopRun.
+            AppHelper.runEventLoop(installInterrupt=True)
+        except KeyboardInterrupt:
+            log.info("shutting down (KeyboardInterrupt)")
+        finally:
+            _cleanup()
+    else:
+        # Overlay disabled — fall back to the original simple wait.
         try:
             listener.join()
         except KeyboardInterrupt:
