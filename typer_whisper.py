@@ -56,17 +56,19 @@ from AppKit import (
     NSWindowCollectionBehaviorStationary,
     NSWindowCollectionBehaviorIgnoresCycle,
     NSVisualEffectView,
-    NSVisualEffectMaterialHUDWindow,
+    NSVisualEffectMaterialHUDWindow, NSVisualEffectMaterialPopover,
     NSVisualEffectBlendingModeBehindWindow,
     NSVisualEffectStateActive,
     NSFontWeightRegular, NSFontWeightMedium, NSFontWeightSemibold,
     NSLineBreakByTruncatingHead,
     NSViewWidthSizable, NSViewHeightSizable,
-    NSAppearance, NSAppearanceNameVibrantDark,
+    NSAppearance, NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight,
     NSImage, NSBezierPath, NSEdgeInsetsMake, NSImageResizingModeStretch,
+    NSImageView, NSImageSymbolConfiguration, NSTextAlignmentCenter,
+    NSFontAttributeName,
 )
 from Quartz import (
-    CABasicAnimation, kCACornerCurveContinuous,
+    CABasicAnimation, CAKeyframeAnimation, kCACornerCurveContinuous,
 )
 from Foundation import NSObject
 from PyObjCTools import AppHelper
@@ -205,18 +207,18 @@ VAD_RMS_FLOOR = float(os.environ.get("TYPER_VAD_RMS_FLOOR", "0.005"))
 # Floating HUD that previews the live transcript next to the mouse
 # cursor. Updates every push interval via main-thread dispatch.
 OVERLAY_ENABLED   = os.environ.get("TYPER_OVERLAY", "1") == "1"
-# Default dimensions tuned to a single line of body text at the modern
-# macOS HUD size (16pt SF Pro Medium). Width is roomy enough for ~70
-# chars before head-truncation kicks in; height matches the system
-# HUD's ~56pt feel.
-OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "560"))
-OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "56"))
+# Light glass HUD dimensions. The target look is a single-line floating
+# input — slim height, wide enough for ~70 chars before head-truncation
+# kicks in, very rounded corners that approach pill-shaped without
+# becoming a circle when text is short.
+OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "640"))
+OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "52"))
 OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "15"))
-# Continuous corner radius. macOS HUD windows use ~14-18pt; we sit
-# in the middle for an unmistakably modern look.
-OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "16"))
+# Generous radius — the design language is "floating soft pill", not
+# "HUD card". Cap below H/2 so we never collapse into a true circle.
+OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "22"))
 OVERLAY_PAD_X         = float(os.environ.get("TYPER_OVERLAY_PAD_X", "18"))
-OVERLAY_PAD_Y         = float(os.environ.get("TYPER_OVERLAY_PAD_Y", "12"))
+OVERLAY_PAD_Y         = float(os.environ.get("TYPER_OVERLAY_PAD_Y", "10"))
 # Whole-panel alpha applied on top of the vibrancy material. 1.0 = the
 # material's native opacity (still translucent thanks to blur); lower
 # values fade everything (background AND text) toward fully see-through.
@@ -274,7 +276,10 @@ model_ready      = threading.Event()  # whisper weights warmed
 model_ok         = False              # whether warm-up actually succeeded
 
 live_active      = False
-live_stop_event  = threading.Event()
+live_stop_event   = threading.Event()
+# Set when the user cancels mid-dictation (e.g. Esc). Causes the final
+# commit to skip the paste step entirely so nothing lands in the field.
+live_cancel_event = threading.Event()
 live_state_lock  = threading.Lock()
 
 f19_held         = False
@@ -560,10 +565,6 @@ class _OverlayController(NSObject):
         if self is None:
             return None
         # ── Panel ──────────────────────────────────────────────────────
-        # Transparent, borderless, non-activating. The visible chrome
-        # comes entirely from the NSVisualEffectView below — that's the
-        # macOS HIG way to get system-blurred, dark/light-mode-aware
-        # backgrounds that look right on any wallpaper.
         rect = NSMakeRect(0, 0, OVERLAY_W, OVERLAY_H)
         style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -583,84 +584,173 @@ class _OverlayController(NSObject):
             | NSWindowCollectionBehaviorIgnoresCycle
         )
 
-        # ── Vibrancy background ────────────────────────────────────────
-        # HUDWindow material is what macOS uses for its own volume /
-        # brightness HUDs — very dark with strong blur. Continuous
-        # corner curve (vs the older quarter-circle) is the modern
-        # iOS/macOS rounding style introduced with the SwiftUI era.
+        # ── Vibrancy surface (light glass) ─────────────────────────────
+        # Popover material + vibrant-light appearance gives the soft
+        # near-white translucent look the design calls for, regardless
+        # of the system's global Light/Dark setting.
         ve = NSVisualEffectView.alloc().initWithFrame_(rect)
-        ve.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        ve.setMaterial_(NSVisualEffectMaterialPopover)
         ve.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
         ve.setState_(NSVisualEffectStateActive)
-        # Force the dark HUD look regardless of system Light/Dark mode.
-        # NSVisualEffectMaterialHUDWindow looks LIGHT under the global
-        # Aqua appearance (this is what the screenshot was showing) and
-        # only renders as the recognizable dark macOS HUD when the view
-        # is in a vibrant-dark appearance.
         ve.setAppearance_(
-            NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark)
+            NSAppearance.appearanceNamed_(NSAppearanceNameVibrantLight)
         )
         ve.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-        # CRITICAL: round the vibrancy via a mask image, not via
-        # layer.cornerRadius. The vibrancy material is composited
-        # outside the layer tree, so cornerRadius can't clip it. Without
-        # the mask image, dark wallpapers show bright triangles in the
-        # window's rectangular corners — the bug the user hit.
+        # Vibrancy material is composited outside the layer tree — only
+        # a mask image actually clips it. Layer cornerRadius alone leaves
+        # bright triangles in the rectangular corners.
         ve.setMaskImage_(_rounded_mask_image(OVERLAY_CORNER_RADIUS))
         ve.setWantsLayer_(True)
         layer = ve.layer()
-        # The layer-level rounding still helps for the shadow/border
-        # (NSWindow synthesizes the shadow from the layer geometry).
         layer.setCornerRadius_(OVERLAY_CORNER_RADIUS)
         try:
             layer.setCornerCurve_(kCACornerCurveContinuous)
         except Exception:
-            pass  # pre-10.15 fallback — never happens on supported macOS
+            pass
         layer.setMasksToBounds_(True)
-        # A hairline white-with-low-alpha border crisps up the edge
-        # against bright wallpapers — same trick AppKit's own HUDs use.
+        # Hairline dark border for definition against light wallpapers.
         layer.setBorderWidth_(0.5)
         layer.setBorderColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.12).CGColor()
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.10).CGColor()
         )
         self.panel.setContentView_(ve)
-        # Force a shadow recompute now that the content shape is
-        # rounded — otherwise the cached shadow keeps the rectangular
-        # silhouette and shows white halos at the corners.
         self.panel.invalidateShadow()
         self._bg = ve
 
-        # ── Recording indicator (red pulsing dot) ──────────────────────
-        # Matches the visual language of macOS's own screen-recording
-        # menu-bar dot and Voice Memos: small, red, gently pulsing.
-        dot_size = 10.0
-        dot_x = OVERLAY_PAD_X
-        dot_y = (OVERLAY_H - dot_size) / 2.0
-        dot_view = NSView.alloc().initWithFrame_(
-            NSMakeRect(dot_x, dot_y, dot_size, dot_size)
+        # ── Recording indicator (red dot with glowing halo) ────────────
+        # Two-layer construction: a soft red halo sized larger than the
+        # solid inner dot, with the halo's opacity pulsing for the
+        # "breathing" effect. Halo is the visual weight; the dot is
+        # crisp and constant.
+        halo_size = 18.0
+        dot_size = 8.0
+        halo_x = OVERLAY_PAD_X
+        halo_y = (OVERLAY_H - halo_size) / 2.0
+        halo = NSView.alloc().initWithFrame_(
+            NSMakeRect(halo_x, halo_y, halo_size, halo_size)
         )
-        dot_view.setWantsLayer_(True)
-        dot_layer = dot_view.layer()
+        halo.setWantsLayer_(True)
+        halo_layer = halo.layer()
+        halo_layer.setCornerRadius_(halo_size / 2.0)
+        # Warm red-orange matching modern macOS recording UIs.
+        halo_layer.setBackgroundColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.95, 0.28, 0.20, 0.28).CGColor()
+        )
+        # Halo gently breathes.
+        breathe = CABasicAnimation.animationWithKeyPath_("opacity")
+        breathe.setFromValue_(1.0)
+        breathe.setToValue_(0.4)
+        breathe.setDuration_(0.9)
+        breathe.setAutoreverses_(True)
+        breathe.setRepeatCount_(1e9)
+        halo_layer.addAnimation_forKey_(breathe, "breathe")
+
+        dot_offset = (halo_size - dot_size) / 2.0
+        dot = NSView.alloc().initWithFrame_(
+            NSMakeRect(dot_offset, dot_offset, dot_size, dot_size)
+        )
+        dot.setWantsLayer_(True)
+        dot_layer = dot.layer()
         dot_layer.setCornerRadius_(dot_size / 2.0)
-        dot_layer.setBackgroundColor_(NSColor.systemRedColor().CGColor())
-        # Gentle opacity pulse, ~1.4 s period. setAutoreverses doubles
-        # that to give a smooth in-out breath.
-        pulse = CABasicAnimation.animationWithKeyPath_("opacity")
-        pulse.setFromValue_(1.0)
-        pulse.setToValue_(0.35)
-        pulse.setDuration_(0.7)
-        pulse.setAutoreverses_(True)
-        pulse.setRepeatCount_(1e9)
-        dot_layer.addAnimation_forKey_(pulse, "pulse")
-        ve.addSubview_(dot_view)
-        self._dot = dot_view
+        dot_layer.setBackgroundColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.95, 0.28, 0.20, 1.0).CGColor()
+        )
+        halo.addSubview_(dot)
+        ve.addSubview_(halo)
+        self._dot = halo
+
+        # ── Right cluster: mic icon | esc pill | separator ─────────────
+        # Lay these out from the right edge inward so the text label can
+        # take all remaining space.
+        right_edge = OVERLAY_W - OVERLAY_PAD_X
+
+        # Mic icon (SF Symbol). Sized at body weight, secondary color
+        # so it reads as ambient indication rather than an action.
+        mic_size = 16.0
+        try:
+            mic_cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                mic_size, NSFontWeightRegular
+            )
+            mic_img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "mic", "Microphone active"
+            )
+            if mic_img is not None:
+                mic_img = mic_img.imageWithSymbolConfiguration_(mic_cfg)
+        except Exception:
+            mic_img = None
+        mic_view_w = mic_size + 4
+        mic_view_h = mic_size + 4
+        mic_x = right_edge - mic_view_w
+        mic_y = (OVERLAY_H - mic_view_h) / 2.0
+        mic_view = NSImageView.alloc().initWithFrame_(
+            NSMakeRect(mic_x, mic_y, mic_view_w, mic_view_h)
+        )
+        if mic_img is not None:
+            mic_view.setImage_(mic_img)
+        try:
+            mic_view.setContentTintColor_(NSColor.secondaryLabelColor())
+        except Exception:
+            pass
+        ve.addSubview_(mic_view)
+        self._mic = mic_view
+
+        # "esc" pill — tappable-looking key cap. Background is a faint
+        # gray fill; text uses the system label color at a small size.
+        esc_w, esc_h = 38.0, 22.0
+        esc_x = mic_x - 10.0 - esc_w
+        esc_y = (OVERLAY_H - esc_h) / 2.0
+        esc_bg = NSView.alloc().initWithFrame_(
+            NSMakeRect(esc_x, esc_y, esc_w, esc_h)
+        )
+        esc_bg.setWantsLayer_(True)
+        esc_bg_layer = esc_bg.layer()
+        esc_bg_layer.setCornerRadius_(6.0)
+        try:
+            esc_bg_layer.setCornerCurve_(kCACornerCurveContinuous)
+        except Exception:
+            pass
+        esc_bg_layer.setBackgroundColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.06).CGColor()
+        )
+        esc_label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(0, 0, esc_w, esc_h)
+        )
+        esc_label.setEditable_(False)
+        esc_label.setSelectable_(False)
+        esc_label.setBezeled_(False)
+        esc_label.setDrawsBackground_(False)
+        esc_label.setFont_(
+            NSFont.systemFontOfSize_weight_(11.0, NSFontWeightMedium)
+        )
+        esc_label.setTextColor_(NSColor.secondaryLabelColor())
+        esc_label.setAlignment_(NSTextAlignmentCenter)
+        esc_label.setStringValue_("esc")
+        esc_label_cell = esc_label.cell()
+        esc_label_cell.setUsesSingleLineMode_(True)
+        # Vertically center the label inside the pill: shift baseline a
+        # touch upward so it sits visually centered (NSTextField default
+        # baseline lands a couple px low for these dimensions).
+        esc_label.setFrame_(NSMakeRect(0, 4.0, esc_w, esc_h - 4.0))
+        esc_bg.addSubview_(esc_label)
+        ve.addSubview_(esc_bg)
+        self._esc = esc_bg
+
+        # Vertical separator hairline between the text area and the
+        # right cluster.
+        sep_h = OVERLAY_H * 0.45
+        sep_y = (OVERLAY_H - sep_h) / 2.0
+        sep_x = esc_x - 12.0
+        sep = NSView.alloc().initWithFrame_(NSMakeRect(sep_x, sep_y, 1.0, sep_h))
+        sep.setWantsLayer_(True)
+        sep.layer().setBackgroundColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.12).CGColor()
+        )
+        ve.addSubview_(sep)
+        self._sep = sep
 
         # ── Transcript label ───────────────────────────────────────────
-        # SF Pro at the system "body" size, medium weight — readable at
-        # a glance without shouting. Color uses semantic label colors so
-        # it adapts automatically to dark/light appearance.
-        text_x = dot_x + dot_size + OVERLAY_PAD_X * 0.9
-        text_w = OVERLAY_W - text_x - OVERLAY_PAD_X
+        text_x = halo_x + halo_size + 10.0
+        text_w = sep_x - text_x - 8.0
         text_h = OVERLAY_H - 2 * OVERLAY_PAD_Y
         self.label = NSTextField.alloc().initWithFrame_(
             NSMakeRect(text_x, OVERLAY_PAD_Y, text_w, text_h)
@@ -669,51 +759,114 @@ class _OverlayController(NSObject):
         self.label.setSelectable_(False)
         self.label.setBezeled_(False)
         self.label.setDrawsBackground_(False)
-        # Regular weight reads as calm and readable on the dark vibrancy;
-        # Medium/Semibold (the previous choice) came out chunky against
-        # the blurred background.
         self.label.setFont_(
             NSFont.systemFontOfSize_weight_(OVERLAY_FONT_SIZE, NSFontWeightRegular)
         )
-        # We forced the visual effect view into vibrant-dark appearance,
-        # so labelColor resolves to the vibrant near-white the HUD wants.
         self.label.setTextColor_(NSColor.labelColor())
         self.label.setStringValue_("")
-        # Truncate from the head so the most recent words stay visible
-        # when the transcript grows longer than the overlay can show.
         cell = self.label.cell()
         cell.setLineBreakMode_(NSLineBreakByTruncatingHead)
         cell.setWraps_(False)
         cell.setScrollable_(False)
         ve.addSubview_(self.label)
+        self._text_x = text_x
+        self._text_max_w = text_w
+
+        # ── Blinking insertion caret ───────────────────────────────────
+        # Thin black bar that sits at the right edge of whatever text is
+        # currently displayed. Hard on/off blink via key-frame timing
+        # (smooth fades don't read as a real text caret).
+        caret_w = 1.6
+        caret_h = OVERLAY_FONT_SIZE + 4
+        caret_y = (OVERLAY_H - caret_h) / 2.0
+        caret = NSView.alloc().initWithFrame_(
+            NSMakeRect(text_x, caret_y, caret_w, caret_h)
+        )
+        caret.setWantsLayer_(True)
+        caret.layer().setBackgroundColor_(NSColor.labelColor().CGColor())
+        caret.layer().setCornerRadius_(caret_w / 2.0)
+        blink = CAKeyframeAnimation.animationWithKeyPath_("opacity")
+        blink.setValues_([1.0, 1.0, 0.0, 0.0])
+        blink.setKeyTimes_([0.0, 0.5, 0.5, 1.0])
+        blink.setDuration_(1.05)
+        blink.setRepeatCount_(1e9)
+        caret.layer().addAnimation_forKey_(blink, "blink")
+        ve.addSubview_(caret)
+        self._caret = caret
+
+        # State for show_/setText_ transitions.
+        self._current_text = ""
         return self
 
     # ── main-thread entry points (called via performSelectorOnMainThread_) ──
     def show_(self, status):
-        """status: short header like 'Listening…' shown above the
-        transcript on first display."""
+        """First display when a dictation session begins. The status
+        string ('Listening…') is set as muted placeholder text."""
         self._position_near_cursor()
-        self._set_placeholder(status or "Listening…")
+        self._current_text = ""
+        self._render(status or "Listening…", placeholder=True)
         self.panel.orderFrontRegardless()
 
     def hide_(self, _ignored):
         self.panel.orderOut_(None)
+        self._current_text = ""
 
     def setText_(self, text):
-        # Empty text → show the listening placeholder so the user isn't
-        # left staring at a blank box while waiting for the first tick.
+        """Live transcript update. Empty/None → 'Dictating…' placeholder
+        (we know capture is active, we just don't have words yet)."""
         if text:
-            self.label.setTextColor_(NSColor.labelColor())
-            self.label.setStringValue_(text)
+            self._current_text = text
+            self._render(text, placeholder=False)
         else:
-            self._set_placeholder("Listening…")
+            self._current_text = ""
+            self._render("Dictating…", placeholder=True)
 
-    def _set_placeholder(self, text):
-        # Muted secondary color signals "no real content yet" without
-        # the visual weight of full-strength label text.
-        self.label.setTextColor_(NSColor.secondaryLabelColor())
+    def setState_(self, state):
+        """Swap the placeholder text. 'listening' → 'Listening…',
+        anything else → 'Dictating…'. No-op if real transcript text is
+        already showing."""
+        if self._current_text:
+            return
+        self._render(
+            "Listening…" if state == "listening" else "Dictating…",
+            placeholder=True,
+        )
+
+    @objc.python_method
+    def _render(self, text, placeholder):
+        # Color: muted for placeholders, full label color for real
+        # transcribed content.
+        self.label.setTextColor_(
+            NSColor.secondaryLabelColor() if placeholder else NSColor.labelColor()
+        )
         self.label.setStringValue_(text)
+        self._reposition_caret(text)
 
+    @objc.python_method
+    def _reposition_caret(self, text):
+        """Move the blinking caret to sit just after the rendered text.
+        Falls back to the left edge when measurement fails."""
+        try:
+            font = self.label.font()
+            attrs = {NSFontAttributeName: font}
+            measured = NSMakeSize(0, 0)
+            if text:
+                measured = (
+                    objc.lookUpClass("NSString")
+                    .stringWithString_(text)
+                    .sizeWithAttributes_(attrs)
+                )
+            # Clamp so the caret never spills past the right edge of the
+            # label's allotted column (matters when the text gets head-
+            # truncated and effectively fills the label).
+            advance = min(measured.width, self._text_max_w)
+            x = self._text_x + advance + 2.0
+            f = self._caret.frame()
+            self._caret.setFrame_(NSMakeRect(x, f.origin.y, f.size.width, f.size.height))
+        except Exception:
+            log.debug("caret reposition failed", exc_info=True)
+
+    @objc.python_method
     def _position_near_cursor(self):
         screen = NSScreen.mainScreen()
         vf = (screen or NSScreen.screens()[0]).visibleFrame()
@@ -782,6 +935,11 @@ def overlay_hide():
 
 def overlay_set_text(text):
     _overlay_call("setText:", text or "")
+
+def overlay_set_state(state):
+    """state ∈ {'listening','dictating'} — only affects the placeholder
+    text. Ignored once real transcript text is showing."""
+    _overlay_call("setState:", state)
 
 
 # ── LIVE STREAMING ────────────────────────────────────────────────────────────
@@ -893,6 +1051,8 @@ def _do_live_stream():
                   len(voiced_buf) / SAMPLE_RATE, infer_ms, text)
         return text
 
+    state = {"transitioned": False}
+
     def _tick_preview():
         """Per-interval tick during recording. Ingests audio, runs a
         whisper preview, and updates the overlay only. NEVER touches the
@@ -900,6 +1060,12 @@ def _do_live_stream():
         or via the legacy diff path in stream mode."""
         nonlocal last_preview, last_pasted
         _ingest_audio()
+        # Flip the placeholder Listening… → Dictating… on the first tick
+        # where VAD has emitted any voiced audio. Signals to the user
+        # that we've heard them even before whisper produces words.
+        if not state["transitioned"] and len(voiced_buf) > 0:
+            state["transitioned"] = True
+            overlay_set_state("dictating")
         text = _transcribe_buffer()
         if text is None:
             return
@@ -918,6 +1084,12 @@ def _do_live_stream():
         FINAL whisper pass, and either pastes the full text (batch) or
         reconciles via diff (stream). Hides the overlay last."""
         nonlocal last_preview, last_pasted
+        # If the user hit Esc, drop everything: no transcribe, no paste,
+        # no overlay revisions — just hide the HUD and bail.
+        if live_cancel_event.is_set():
+            log.info("commit-final: cancelled, skipping paste")
+            overlay_hide()
+            return
         _ingest_audio()
         text = _transcribe_buffer()
         if text is None:
@@ -996,6 +1168,7 @@ def start_live_dictation():
             log.warning("model not loaded; ignoring start")
             return
         live_stop_event.clear()
+        live_cancel_event.clear()
         live_active = True
     log.info("🎤 Live — speak now")
     threading.Thread(target=lambda: subprocess.run(
@@ -1018,6 +1191,16 @@ def stop_live_dictation():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
         daemon=True, name="sound-stop").start()
 
+def cancel_live_dictation():
+    """Stop dictation AND mark this session as cancelled so the final
+    commit skips the paste. Used by Esc keybinding so the user can back
+    out of a hold-to-talk session without pasting whatever they said."""
+    if not live_active:
+        return
+    log.info("✖ cancel")
+    live_cancel_event.set()
+    stop_live_dictation()
+
 # ── KEYBOARD LISTENER ────────────────────────────────────────────────────────
 def _toggle_live():
     if live_active:
@@ -1039,6 +1222,12 @@ def on_press(key):
             log.debug("F19 press → toggle (active=%s)", live_active)
             threading.Thread(target=_toggle_live, daemon=True,
                              name="toggle-live").start()
+    elif key == keyboard.Key.esc and live_active:
+        # The "esc" pill in the HUD advertises this — cancel the
+        # in-flight session, drop the captured audio, don't paste.
+        log.debug("Esc press → cancel dictation")
+        threading.Thread(target=cancel_live_dictation, daemon=True,
+                         name="cancel-live").start()
 
 def on_release(key):
     global f19_held, rcmd_held
