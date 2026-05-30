@@ -59,9 +59,10 @@ from AppKit import (
     NSVisualEffectMaterialHUDWindow,
     NSVisualEffectBlendingModeBehindWindow,
     NSVisualEffectStateActive,
-    NSFontWeightMedium, NSFontWeightSemibold,
+    NSFontWeightRegular, NSFontWeightMedium, NSFontWeightSemibold,
     NSLineBreakByTruncatingHead,
     NSViewWidthSizable, NSViewHeightSizable,
+    NSAppearance, NSAppearanceNameVibrantDark,
 )
 from Quartz import (
     CABasicAnimation, kCACornerCurveContinuous,
@@ -552,6 +553,14 @@ class _OverlayController(NSObject):
         ve.setMaterial_(NSVisualEffectMaterialHUDWindow)
         ve.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
         ve.setState_(NSVisualEffectStateActive)
+        # Force the dark HUD look regardless of system Light/Dark mode.
+        # NSVisualEffectMaterialHUDWindow looks LIGHT under the global
+        # Aqua appearance (this is what the screenshot was showing) and
+        # only renders as the recognizable dark macOS HUD when the view
+        # is in a vibrant-dark appearance.
+        ve.setAppearance_(
+            NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark)
+        )
         ve.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         ve.setWantsLayer_(True)
         layer = ve.layer()
@@ -561,6 +570,12 @@ class _OverlayController(NSObject):
         except Exception:
             pass  # pre-10.15 fallback — never happens on supported macOS
         layer.setMasksToBounds_(True)
+        # A hairline white-with-low-alpha border crisps up the edge
+        # against bright wallpapers — same trick AppKit's own HUDs use.
+        layer.setBorderWidth_(0.5)
+        layer.setBorderColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.12).CGColor()
+        )
         self.panel.setContentView_(ve)
         self._bg = ve
 
@@ -603,10 +618,14 @@ class _OverlayController(NSObject):
         self.label.setSelectable_(False)
         self.label.setBezeled_(False)
         self.label.setDrawsBackground_(False)
+        # Regular weight reads as calm and readable on the dark vibrancy;
+        # Medium/Semibold (the previous choice) came out chunky against
+        # the blurred background.
         self.label.setFont_(
-            NSFont.systemFontOfSize_weight_(OVERLAY_FONT_SIZE, NSFontWeightMedium)
+            NSFont.systemFontOfSize_weight_(OVERLAY_FONT_SIZE, NSFontWeightRegular)
         )
-        # labelColor adapts: black-ish on light, white-ish on dark.
+        # We forced the visual effect view into vibrant-dark appearance,
+        # so labelColor resolves to the vibrant near-white the HUD wants.
         self.label.setTextColor_(NSColor.labelColor())
         self.label.setStringValue_("")
         # Truncate from the head so the most recent words stay visible
@@ -620,10 +639,10 @@ class _OverlayController(NSObject):
 
     # ── main-thread entry points (called via performSelectorOnMainThread_) ──
     def show_(self, status):
-        """status: short header like '🎤 listening…' shown above the
+        """status: short header like 'Listening…' shown above the
         transcript on first display."""
         self._position_near_cursor()
-        self.label.setStringValue_(status or "Listening…")
+        self._set_placeholder(status or "Listening…")
         self.panel.orderFrontRegardless()
 
     def hide_(self, _ignored):
@@ -632,7 +651,17 @@ class _OverlayController(NSObject):
     def setText_(self, text):
         # Empty text → show the listening placeholder so the user isn't
         # left staring at a blank box while waiting for the first tick.
-        self.label.setStringValue_(text or "Listening…")
+        if text:
+            self.label.setTextColor_(NSColor.labelColor())
+            self.label.setStringValue_(text)
+        else:
+            self._set_placeholder("Listening…")
+
+    def _set_placeholder(self, text):
+        # Muted secondary color signals "no real content yet" without
+        # the visual weight of full-strength label text.
+        self.label.setTextColor_(NSColor.secondaryLabelColor())
+        self.label.setStringValue_(text)
 
     def _position_near_cursor(self):
         screen = NSScreen.mainScreen()
