@@ -207,18 +207,17 @@ VAD_RMS_FLOOR = float(os.environ.get("TYPER_VAD_RMS_FLOOR", "0.005"))
 # Floating HUD that previews the live transcript next to the mouse
 # cursor. Updates every push interval via main-thread dispatch.
 OVERLAY_ENABLED   = os.environ.get("TYPER_OVERLAY", "1") == "1"
-# Light glass HUD dimensions. The target look is a single-line floating
-# input — slim height, wide enough for ~70 chars before head-truncation
-# kicks in, very rounded corners that approach pill-shaped without
-# becoming a circle when text is short.
-OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "560"))
-OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "48"))
-OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "15"))
-# Generous radius — the design language is "floating soft pill", not
-# "HUD card". Cap below H/2 so we never collapse into a true circle.
-OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "22"))
-OVERLAY_PAD_X         = float(os.environ.get("TYPER_OVERLAY_PAD_X", "18"))
-OVERLAY_PAD_Y         = float(os.environ.get("TYPER_OVERLAY_PAD_Y", "10"))
+# Light glass HUD dimensions, matching the reference CSS:
+#   min-height: 72px, padding: 0 28px, border-radius: 32px,
+#   font-size: 22px (medium weight), color rgba(0,0,0,0.72)
+# Wide pill shape that scales with viewport in the CSS spec — we pick
+# a fixed pixel width that gives the same proportions on a 13–16" mac.
+OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "780"))
+OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "72"))
+OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "22"))
+OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "32"))
+OVERLAY_PAD_X         = float(os.environ.get("TYPER_OVERLAY_PAD_X", "28"))
+OVERLAY_PAD_Y         = float(os.environ.get("TYPER_OVERLAY_PAD_Y", "14"))
 # Whole-panel alpha applied on top of the vibrancy material. 1.0 = the
 # material's native opacity (still translucent thanks to blur); lower
 # values fade everything (background AND text) toward fully see-through.
@@ -608,10 +607,12 @@ class _OverlayController(NSObject):
         except Exception:
             pass
         layer.setMasksToBounds_(True)
-        # Hairline dark border for definition against light wallpapers.
-        layer.setBorderWidth_(0.5)
+        # 1pt black @ 8% — matches CSS spec
+        # `border: 1px solid rgba(0, 0, 0, 0.08)`. Subtle but visible
+        # against light wallpapers and on the light glass itself.
+        layer.setBorderWidth_(1.0)
         layer.setBorderColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.10).CGColor()
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.08).CGColor()
         )
         self.panel.setContentView_(ve)
         self.panel.invalidateShadow()
@@ -624,8 +625,8 @@ class _OverlayController(NSObject):
         # indicator wash out at the low end of the cycle. Siblings keep
         # the solid dot anchored at full saturation while only the halo
         # breathes.
-        dot_size = 9.0
-        halo_size = 19.0
+        dot_size = 14.0
+        halo_size = 28.0
         center_y = OVERLAY_H / 2.0
         center_x = OVERLAY_PAD_X + halo_size / 2.0
         red = NSColor.colorWithCalibratedRed_green_blue_alpha_(
@@ -670,7 +671,7 @@ class _OverlayController(NSObject):
 
         # Mic icon (SF Symbol). Sized at body weight, secondary color
         # so it reads as ambient indication rather than an action.
-        mic_size = 16.0
+        mic_size = 22.0
         try:
             mic_cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
                 mic_size, NSFontWeightRegular
@@ -700,21 +701,21 @@ class _OverlayController(NSObject):
 
         # "esc" pill — tappable-looking key cap. Background is a faint
         # gray fill; text uses the system label color at a small size.
-        esc_w, esc_h = 38.0, 22.0
-        esc_x = mic_x - 10.0 - esc_w
+        esc_w, esc_h = 50.0, 30.0
+        esc_x = mic_x - 14.0 - esc_w
         esc_y = (OVERLAY_H - esc_h) / 2.0
         esc_bg = NSView.alloc().initWithFrame_(
             NSMakeRect(esc_x, esc_y, esc_w, esc_h)
         )
         esc_bg.setWantsLayer_(True)
         esc_bg_layer = esc_bg.layer()
-        esc_bg_layer.setCornerRadius_(6.0)
+        esc_bg_layer.setCornerRadius_(8.0)
         try:
             esc_bg_layer.setCornerCurve_(kCACornerCurveContinuous)
         except Exception:
             pass
         esc_bg_layer.setBackgroundColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.06).CGColor()
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.05).CGColor()
         )
         esc_label = NSTextField.alloc().initWithFrame_(
             NSMakeRect(0, 0, esc_w, esc_h)
@@ -724,17 +725,18 @@ class _OverlayController(NSObject):
         esc_label.setBezeled_(False)
         esc_label.setDrawsBackground_(False)
         esc_label.setFont_(
-            NSFont.systemFontOfSize_weight_(11.0, NSFontWeightMedium)
+            NSFont.systemFontOfSize_weight_(13.0, NSFontWeightMedium)
         )
-        esc_label.setTextColor_(NSColor.secondaryLabelColor())
+        esc_label.setTextColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
+        )
         esc_label.setAlignment_(NSTextAlignmentCenter)
         esc_label.setStringValue_("esc")
         esc_label_cell = esc_label.cell()
         esc_label_cell.setUsesSingleLineMode_(True)
-        # Vertically center the label inside the pill: shift baseline a
-        # touch upward so it sits visually centered (NSTextField default
-        # baseline lands a couple px low for these dimensions).
-        esc_label.setFrame_(NSMakeRect(0, 4.0, esc_w, esc_h - 4.0))
+        # Vertically center: NSTextField baseline lands a couple px low
+        # for these dimensions, shift upward.
+        esc_label.setFrame_(NSMakeRect(0, 5.0, esc_w, esc_h - 5.0))
         esc_bg.addSubview_(esc_label)
         ve.addSubview_(esc_bg)
         self._esc = esc_bg
@@ -767,10 +769,14 @@ class _OverlayController(NSObject):
         self.label.setSelectable_(False)
         self.label.setBezeled_(False)
         self.label.setDrawsBackground_(False)
+        # Medium weight + 72% black, per the reference CSS
+        # (font-weight: 500, color: rgba(0,0,0,0.72)).
         self.label.setFont_(
-            NSFont.systemFontOfSize_weight_(OVERLAY_FONT_SIZE, NSFontWeightRegular)
+            NSFont.systemFontOfSize_weight_(OVERLAY_FONT_SIZE, NSFontWeightMedium)
         )
-        self.label.setTextColor_(NSColor.labelColor())
+        self.label.setTextColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.72)
+        )
         self.label.setStringValue_("")
         cell = self.label.cell()
         cell.setLineBreakMode_(NSLineBreakByTruncatingHead)
@@ -784,14 +790,16 @@ class _OverlayController(NSObject):
         # Sized to match the label's cap height so it reads as a real
         # text caret. Hard on/off via keyframe timing (a smooth fade
         # looks like UI breath, not a cursor).
-        caret_w = 1.8
-        caret_h = OVERLAY_FONT_SIZE + 2
+        caret_w = 2.0
+        caret_h = OVERLAY_FONT_SIZE + 6
         caret_y = (OVERLAY_H - caret_h) / 2.0
         caret = NSView.alloc().initWithFrame_(
             NSMakeRect(text_x, caret_y, caret_w, caret_h)
         )
         caret.setWantsLayer_(True)
-        caret.layer().setBackgroundColor_(NSColor.labelColor().CGColor())
+        caret.layer().setBackgroundColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.72).CGColor()
+        )
         caret.layer().setCornerRadius_(caret_w / 2.0)
         blink = CAKeyframeAnimation.animationWithKeyPath_("opacity")
         blink.setValues_([1.0, 1.0, 0.0, 0.0])
@@ -842,11 +850,14 @@ class _OverlayController(NSObject):
 
     @objc.python_method
     def _render(self, text, placeholder):
-        # Color: muted for placeholders, full label color for real
-        # transcribed content.
-        self.label.setTextColor_(
-            NSColor.secondaryLabelColor() if placeholder else NSColor.labelColor()
-        )
+        # Color: muted black for placeholders, the spec's 72% black for
+        # real transcribed content. Keeps both states on the same hue
+        # axis (no blue secondary-label tint).
+        if placeholder:
+            color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.42)
+        else:
+            color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.72)
+        self.label.setTextColor_(color)
         self.label.setStringValue_(text)
         self._reposition_caret(text)
 
