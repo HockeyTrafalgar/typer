@@ -216,6 +216,11 @@ OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "15"))
 OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "16"))
 OVERLAY_PAD_X         = float(os.environ.get("TYPER_OVERLAY_PAD_X", "18"))
 OVERLAY_PAD_Y         = float(os.environ.get("TYPER_OVERLAY_PAD_Y", "12"))
+# Whole-panel alpha applied on top of the vibrancy material. 1.0 = the
+# material's native opacity (still translucent thanks to blur); lower
+# values fade everything (background AND text) toward fully see-through.
+# 0.75 reads as a clearly translucent HUD without losing text legibility.
+OVERLAY_ALPHA         = float(os.environ.get("TYPER_OVERLAY_ALPHA", "0.75"))
 #   "caret"  — sit next to the focused text-input caret via macOS
 #              Accessibility API (best UX; requires AX permission).
 #   "cursor" — anchor to the mouse cursor position.
@@ -541,6 +546,7 @@ class _OverlayController(NSObject):
         self.panel.setLevel_(NSFloatingWindowLevel)
         self.panel.setOpaque_(False)
         self.panel.setBackgroundColor_(NSColor.clearColor())
+        self.panel.setAlphaValue_(OVERLAY_ALPHA)
         self.panel.setHasShadow_(True)
         self.panel.setBecomesKeyOnlyIfNeeded_(True)
         self.panel.setHidesOnDeactivate_(False)
