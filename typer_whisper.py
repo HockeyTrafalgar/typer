@@ -231,7 +231,7 @@ OVERLAY_W            = int(os.environ.get("TYPER_OVERLAY_W", "780"))
 # grows past this as the transcript wraps, capped at OVERLAY_MAX_H.
 OVERLAY_H            = int(os.environ.get("TYPER_OVERLAY_H", "72"))
 OVERLAY_MAX_H        = int(os.environ.get("TYPER_OVERLAY_MAX_H", "320"))
-OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "22"))
+OVERLAY_FONT_SIZE    = float(os.environ.get("TYPER_OVERLAY_FONT_SIZE", "17"))
 # Spotlight uses a fully-rounded pill (radius = H/2). Default to that.
 OVERLAY_CORNER_RADIUS = float(os.environ.get("TYPER_OVERLAY_CORNER", "36"))
 OVERLAY_PAD_X         = float(os.environ.get("TYPER_OVERLAY_PAD_X", "28"))
