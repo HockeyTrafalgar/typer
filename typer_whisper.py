@@ -823,15 +823,10 @@ class _OverlayController(NSObject):
 
     @objc.python_method
     def _render(self, text, placeholder):
-        # Color: muted near-black for placeholders (matching the
-        # Spotlight Search placeholder hue at ~55% black), real
-        # transcribed content at full 80% black so it visibly "wins"
-        # over the placeholder. Both stay on the same hue axis (no
-        # secondary-label blue tint).
-        if placeholder:
-            color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
-        else:
-            color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.80)
+        # Both placeholder and live-transcript text share the SAME hue
+        # as the mic icon (black @ 55% alpha) for a single, calm
+        # typographic voice across the whole HUD.
+        color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
         self.label.setTextColor_(color)
         self.label.setStringValue_(text)
         self._resize_to_fit(text)
