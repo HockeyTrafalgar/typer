@@ -1,7 +1,16 @@
-parakeet-mlx
-pynput
-pyperclip
-sounddevice
+# ── shared ──────────────────────────────────────────────────────────────────
+pynput          # global hotkey listener + synthetic keystrokes for paste
+pyperclip       # ⌘V paste mechanism — copy then synthetic Cmd+V
+sounddevice     # mic capture
 numpy
-silero-vad
-onnxruntime
+silero-vad      # voice activity detection so silence isn't fed to the ASR
+onnxruntime     # silero VAD runs through onnx
+torch           # silero-vad's tensor interface (not actually used for inference)
+
+# ── Whisper variant (typer_whisper.py) ──────────────────────────────────────
+mlx-whisper     # Apple Silicon native Whisper via MLX
+pyobjc          # AppKit / Quartz / ApplicationServices for the floating HUD
+                # and the Accessibility-API caret lookup
+
+# ── Parakeet variant (typer.py) ─────────────────────────────────────────────
+parakeet-mlx    # NVIDIA Parakeet-TDT via MLX (multilingual, true streaming)
