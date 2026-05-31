@@ -72,6 +72,11 @@ from pynput import keyboard
 import mlx_whisper
 from silero_vad import load_silero_vad
 
+# Magic Mouse double-tap-and-hold gesture detector. Lives in its own
+# module because it pokes a private Apple framework via ctypes and is
+# allowed to fail without breaking the rest of the app.
+from typer_mouse import GestureDetector as _MouseGestureDetector
+
 # AppKit (PyObjC) drives the live-transcription overlay HUD. NSPanel with
 # becomesKeyOnlyIfNeeded + nonactivating behavior is the only way to get a
 # floating window on macOS that NEVER steals focus from the user's app —
@@ -1447,6 +1452,22 @@ def main():
     # otherwise gets paid on every Right-⌘ press and silently swallows
     # the first words of each session.
     _open_persistent_audio_input()
+
+    # Magic Mouse double-tap-and-hold trigger. Same semantics as
+    # Right-⌘: hold to dictate, release to stop. start() returns False
+    # if no Magic Mouse is connected or MultitouchSupport can't load —
+    # we just log it and keep the keyboard triggers running.
+    def _mouse_press_start():
+        log.debug("mouse double-tap-hold start")
+        threading.Thread(target=start_live_dictation, daemon=True,
+                         name="mouse-start-live").start()
+    def _mouse_press_end():
+        log.debug("mouse double-tap-hold release")
+        threading.Thread(target=stop_live_dictation, daemon=True,
+                         name="mouse-stop-live").start()
+    mouse_detector = _MouseGestureDetector(_mouse_press_start, _mouse_press_end)
+    mouse_detector.start()
+
     log.info("🟢 ready (mode=%s). Hold Right-⌘ to talk, or tap F19 to toggle.",
              TYPER_MODE)
 
@@ -1464,6 +1485,10 @@ def main():
                 _audio_input_stream.close()
             except Exception:
                 log.debug("audio stream close failed", exc_info=True)
+        try:
+            mouse_detector.stop()
+        except Exception:
+            log.debug("mouse detector stop failed", exc_info=True)
     atexit.register(_cleanup)
 
     # Hard SIGINT / SIGTERM handlers. AppHelper.runEventLoop(installInterrupt
