@@ -511,6 +511,64 @@ class VadGate:
 vad_model = None
 vad_model_lock = threading.Lock()
 
+# ── Persistent audio input ──────────────────────────────────────────────────
+# CoreAudio takes ~100-300 ms to open an InputStream the first time the
+# device is touched, plus a smaller open-cost on each subsequent open.
+# Opening fresh per-session (the old behavior) means the first samples
+# after Right-⌘ press are silently dropped while the device spins up.
+# Solution: open once at app startup and keep the stream live for the
+# process lifetime. The callback discards samples between sessions so
+# we don't grow the queue or eat CPU during idle.
+_persistent_audio_q = queue.Queue()
+_audio_session_active = threading.Event()
+_audio_input_stream = None
+_audio_cb_stats = {"calls": 0, "frames": 0, "status_warns": 0}
+
+def _open_persistent_audio_input():
+    """Open the mic once on app startup and keep it open for the
+    lifetime of the process. Safe to call repeatedly — only the first
+    call actually opens the device."""
+    global _audio_input_stream
+    if _audio_input_stream is not None:
+        return _audio_input_stream
+
+    def _cb(indata, frames, time_info, status):
+        _audio_cb_stats["calls"] += 1
+        _audio_cb_stats["frames"] += frames
+        if status:
+            _audio_cb_stats["status_warns"] += 1
+            log.warning("audio callback status: %s", status)
+        # Cheap no-op between sessions — no allocation, no enqueue.
+        if not _audio_session_active.is_set():
+            return
+        _persistent_audio_q.put(indata[:, 0].copy())
+
+    try:
+        _audio_input_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=int(SAMPLE_RATE * 0.1),
+            callback=_cb,
+        )
+        _audio_input_stream.start()
+        log.info("audio input opened (persistent, sr=%d)", SAMPLE_RATE)
+    except Exception:
+        log.exception("failed to open persistent audio input — "
+                      "will fall back to per-session open in _do_live_stream")
+        _audio_input_stream = None
+    return _audio_input_stream
+
+def _drain_persistent_audio_q():
+    """Discard any audio sitting in the queue. Called at session start
+    so we don't process stale pre-session samples (shouldn't happen
+    because the callback discards when inactive, but cheap insurance)."""
+    while True:
+        try:
+            _persistent_audio_q.get_nowait()
+        except queue.Empty:
+            return
+
 def _get_vad_model():
     global vad_model
     with vad_model_lock:
@@ -1030,18 +1088,35 @@ def _do_live_stream():
     Captures voiced audio into a rolling buffer; every LIVE_PUSH_INTERVAL_S
     re-runs Whisper on the whole buffer and diff-pastes the new suffix.
     Runs ON THE INFERENCE THREAD (MLX owner).
+
+    Audio comes from the PERSISTENT InputStream opened once at app
+    startup (see _open_persistent_audio_input). Falls back to opening
+    a per-session stream only if the persistent one failed to come up.
     """
     log.info("live stream begin")
-    audio_q = queue.Queue()
-    cb_stats = {"frames": 0, "calls": 0, "status_warns": 0}
-
-    def _audio_cb(indata, frames, time_info, status):
-        cb_stats["calls"] += 1
-        cb_stats["frames"] += frames
-        if status:
-            cb_stats["status_warns"] += 1
-            log.warning("audio callback status: %s", status)
-        audio_q.put(indata[:, 0].copy())
+    use_persistent = _audio_input_stream is not None
+    if use_persistent:
+        audio_q = _persistent_audio_q
+        # Discard anything captured between sessions (the callback
+        # should already be no-oping, but cheap insurance against any
+        # in-flight buffer at the moment we flip the flag).
+        _drain_persistent_audio_q()
+        cb_stats = _audio_cb_stats
+        fallback_cb = None
+    else:
+        # Fallback path: open a fresh stream just for this session.
+        # ~100-300 ms of mic open latency, used only if the persistent
+        # stream failed at startup (e.g. permissions denied at that
+        # moment and then granted afterward — user restart fixes it).
+        audio_q = queue.Queue()
+        cb_stats = {"frames": 0, "calls": 0, "status_warns": 0}
+        def fallback_cb(indata, frames, time_info, status):
+            cb_stats["calls"] += 1
+            cb_stats["frames"] += frames
+            if status:
+                cb_stats["status_warns"] += 1
+                log.warning("audio callback status: %s", status)
+            audio_q.put(indata[:, 0].copy())
 
     gate = None
     try:
@@ -1204,14 +1279,25 @@ def _do_live_stream():
                  WHISPER_CONDITION_ON_PREV, WHISPER_LANGUAGE or "auto",
                  _WHISPER_HALLUCINATION_SILENCE_PARSED, WHISPER_INITIAL_PROMPT)
         overlay_show("Listening…")
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=int(SAMPLE_RATE * 0.1),
-            callback=_audio_cb,
-        ):
-            log.debug("audio input opened sr=%d", SAMPLE_RATE)
+        # Activate the persistent callback so it starts enqueueing
+        # samples; the device itself is already open and primed, so
+        # the FIRST samples after this flag flip are real speech, not
+        # CoreAudio open-stream silence.
+        _audio_session_active.set()
+        try:
+            if not use_persistent:
+                # Fallback: spin up a per-session stream now.
+                fallback_stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=int(SAMPLE_RATE * 0.1),
+                    callback=fallback_cb,
+                )
+                fallback_stream.start()
+                log.debug("audio input opened (per-session fallback) sr=%d", SAMPLE_RATE)
+            else:
+                log.debug("audio input enabled (persistent stream)")
             while not live_stop_event.is_set():
                 # wait() returns immediately when the user releases, instead
                 # of finishing the full LIVE_PUSH_INTERVAL_S sleep — keeps
@@ -1231,6 +1317,16 @@ def _do_live_stream():
                     log.debug("tick %d: preview=%.0fms", iters, tick_ms)
             log.debug("commit-final after %d iters", iters)
             _commit_final()
+        finally:
+            # Stop the callback from collecting more samples; the
+            # persistent stream itself stays OPEN for the next session.
+            _audio_session_active.clear()
+            if not use_persistent and 'fallback_stream' in dir():
+                try:
+                    fallback_stream.stop()
+                    fallback_stream.close()
+                except Exception:
+                    log.debug("fallback stream close failed", exc_info=True)
     except Exception:
         log.exception("stream error")
         overlay_hide()
@@ -1346,6 +1442,11 @@ def main():
     if not model_ok:
         log.critical("model load failed — exiting")
         sys.exit(1)
+    # Open the mic ONCE now and keep it open for the rest of the
+    # process. CoreAudio's open-stream latency (~100-300 ms first call)
+    # otherwise gets paid on every Right-⌘ press and silently swallows
+    # the first words of each session.
+    _open_persistent_audio_input()
     log.info("🟢 ready (mode=%s). Hold Right-⌘ to talk, or tap F19 to toggle.",
              TYPER_MODE)
 
@@ -1354,6 +1455,15 @@ def main():
         if live_active:
             stop_live_dictation()
         overlay_hide()
+        # Stop the persistent input stream so CoreAudio releases the
+        # device promptly on exit. os._exit (used by our SIGINT handler)
+        # would skip this otherwise.
+        if _audio_input_stream is not None:
+            try:
+                _audio_input_stream.stop()
+                _audio_input_stream.close()
+            except Exception:
+                log.debug("audio stream close failed", exc_info=True)
     atexit.register(_cleanup)
 
     # Hard SIGINT / SIGTERM handlers. AppHelper.runEventLoop(installInterrupt
