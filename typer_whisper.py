@@ -319,6 +319,17 @@ def _setup_logging():
             exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
         )
     threading.excepthook = _thread_excepthook
+    # Silence noisy third-party loggers that don't add user-visible
+    # signal at DEBUG. numba dumps its SSA IR for every JIT compilation
+    # (triggered by silero-vad's onnx path); httpx/httpcore dump every
+    # HTTP round-trip even when we never make any. Pin them to WARNING
+    # regardless of TYPER_LOG_LEVEL so our own DEBUG output stays usable.
+    for noisy in (
+        "numba", "httpx", "httpcore",
+        "urllib3", "huggingface_hub",
+        "matplotlib", "PIL",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger("typer").info("Logging to %s (level=%s)", log_path, LOG_LEVEL)
     return log_path
 
