@@ -222,6 +222,14 @@ WHISPER_INITIAL_PROMPT = os.environ.get("TYPER_INITIAL_PROMPT", "") or None
 # slower per call. We cap a bit under that to keep latency bounded.
 MAX_BUFFER_S = float(os.environ.get("TYPER_MAX_BUFFER_S", "28.0"))
 
+# Minimum voiced-audio duration before we run a PREVIEW transcribe.
+# Whisper happily hallucinates plausible text on tiny chunks ("Thank
+# you.", "Bye."), so until we have ≥ this many seconds of voiced
+# audio the HUD just stays on "Dictating…" without committing to a
+# guess. The final commit-on-release path uses its own much lower
+# threshold so short legitimate utterances ("yes", "no") still paste.
+MIN_PREVIEW_AUDIO_S = float(os.environ.get("TYPER_MIN_PREVIEW_S", "1.0"))
+
 # Single keyboard controller for synthetic keystrokes.
 _kbd = keyboard.Controller()
 
@@ -1165,10 +1173,11 @@ def _do_live_stream():
             voiced_buf = voiced_buf[drop:]
         return True
 
-    def _transcribe_buffer():
+    def _transcribe_buffer(min_audio_s=0.25):
         """Run Whisper on the current voiced_buf. Returns the text, or
-        None if the buffer is too short / inference failed."""
-        if len(voiced_buf) < SAMPLE_RATE // 4:  # < 0.25s — not worth a call
+        None if the buffer is shorter than `min_audio_s` (whisper
+        hallucinates on tiny chunks) or inference failed."""
+        if len(voiced_buf) < int(min_audio_s * SAMPLE_RATE):
             return None
         t_infer = time.time()
         try:
@@ -1205,7 +1214,13 @@ def _do_live_stream():
         if not state["transitioned"] and len(voiced_buf) > 0:
             state["transitioned"] = True
             overlay_set_state("dictating")
-        text = _transcribe_buffer()
+        # Hold off on running whisper until we have at least
+        # MIN_PREVIEW_AUDIO_S of voiced audio. Whisper produces
+        # plausible-but-wrong text on shorter chunks ("Thank you.",
+        # "Bye.", "Subtitles by …") and showing that in the HUD just
+        # confuses the user. Final commit-on-release uses its own much
+        # lower threshold so short legitimate utterances still paste.
+        text = _transcribe_buffer(min_audio_s=MIN_PREVIEW_AUDIO_S)
         if text is None:
             return
         state["preview_buf_samples"] = len(voiced_buf)
