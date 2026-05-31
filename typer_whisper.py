@@ -1359,10 +1359,6 @@ def start_live_dictation():
         live_cancel_event.clear()
         live_active = True
     log.info("🎤 Live — speak now")
-    threading.Thread(target=lambda: subprocess.run(
-        ['afplay', '/System/Library/Sounds/Blow.aiff'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
-        daemon=True, name="sound-start").start()
     inference_q.put(("live",))
 
 def stop_live_dictation():
@@ -1374,10 +1370,6 @@ def stop_live_dictation():
         live_active = False
         live_stop_event.set()
     log.info("✅ stopped")
-    threading.Thread(target=lambda: subprocess.run(
-        ['afplay', '/System/Library/Sounds/Funk.aiff'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
-        daemon=True, name="sound-stop").start()
 
 def cancel_live_dictation():
     """Stop dictation AND mark this session as cancelled so the final
