@@ -69,6 +69,7 @@ def _maybe_enable_hf_offline():
 _maybe_enable_hf_offline()
 
 from pynput import keyboard
+from pynput import mouse as _pynput_mouse
 import mlx_whisper
 from silero_vad import load_silero_vad
 
@@ -1536,6 +1537,94 @@ def on_release(key):
         f19_held = False
         log.debug("F19 release (no-op for toggle)")
 
+# ── MOUSE LISTENER (left-click long-press) ──────────────────────────────────
+# Hold the LEFT mouse button for MOUSE_HOLD_MS without moving the cursor
+# more than MOUSE_MOVE_THRESHOLD_PX = start dictation. Release = stop.
+# A movement past the threshold within the hold window cancels the
+# trigger so normal click-and-drag (text selection, window drag) keeps
+# working unchanged. Uses pynput's public CGEventTap-backed listener —
+# no private API, no entitlements needed.
+MOUSE_HOLD_MS = int(os.environ.get("TYPER_MOUSE_HOLD_MS", "700"))
+MOUSE_MOVE_THRESHOLD_PX = float(os.environ.get("TYPER_MOUSE_MOVE_PX", "5"))
+
+_mouse_click_lock = threading.Lock()
+_mouse_click_state = {
+    "down": False,
+    "x0": 0,
+    "y0": 0,
+    "moved": False,
+    "fired_start": False,
+    "timer": None,
+}
+
+def _mouse_hold_timer_fire():
+    """Runs MOUSE_HOLD_MS after a left-down event. Fires the start
+    callback only if the button is still down and the cursor hasn't
+    drifted past the movement threshold."""
+    with _mouse_click_lock:
+        if not _mouse_click_state["down"]:
+            return  # released before threshold
+        if _mouse_click_state["moved"]:
+            return  # turned into a drag, don't hijack it
+        if _mouse_click_state["fired_start"]:
+            return  # defensive — shouldn't happen
+        _mouse_click_state["fired_start"] = True
+    log.debug("mouse left-click long-press → hold-to-talk start")
+    threading.Thread(target=start_live_dictation, daemon=True,
+                     name="mouse-start-live").start()
+
+def _mouse_on_click(x, y, button, pressed):
+    if button != _pynput_mouse.Button.left:
+        return
+    if pressed:
+        with _mouse_click_lock:
+            # Cancel any previous timer (defensive — only happens if
+            # someone clicks twice without a release event somehow).
+            old = _mouse_click_state["timer"]
+            if old is not None:
+                old.cancel()
+            _mouse_click_state["down"] = True
+            _mouse_click_state["x0"] = x
+            _mouse_click_state["y0"] = y
+            _mouse_click_state["moved"] = False
+            _mouse_click_state["fired_start"] = False
+            t = threading.Timer(MOUSE_HOLD_MS / 1000.0, _mouse_hold_timer_fire)
+            t.daemon = True
+            _mouse_click_state["timer"] = t
+            t.start()
+    else:
+        with _mouse_click_lock:
+            fired = _mouse_click_state["fired_start"]
+            t = _mouse_click_state["timer"]
+            if t is not None:
+                t.cancel()
+            _mouse_click_state["down"] = False
+            _mouse_click_state["timer"] = None
+            _mouse_click_state["fired_start"] = False
+        if fired:
+            log.debug("mouse release → hold-to-talk stop")
+            threading.Thread(target=stop_live_dictation, daemon=True,
+                             name="mouse-stop-live").start()
+
+def _mouse_on_move(x, y):
+    # Hot path: on_move fires constantly as the cursor wanders. Bail
+    # out fast when the button isn't down.
+    if not _mouse_click_state["down"]:
+        return
+    with _mouse_click_lock:
+        if not _mouse_click_state["down"] or _mouse_click_state["moved"]:
+            return
+        dx = x - _mouse_click_state["x0"]
+        dy = y - _mouse_click_state["y0"]
+        if dx * dx + dy * dy > MOUSE_MOVE_THRESHOLD_PX ** 2:
+            _mouse_click_state["moved"] = True
+            t = _mouse_click_state["timer"]
+            if t is not None:
+                t.cancel()
+                _mouse_click_state["timer"] = None
+            log.debug("mouse moved %.1fpx — canceling hold-to-talk",
+                      (dx * dx + dy * dy) ** 0.5)
+
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     print("""
@@ -1633,6 +1722,19 @@ def main():
     # are marshalled onto this main loop via performSelectorOnMainThread_.
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
+
+    # Mouse listener for the left-click long-press trigger. Same
+    # CGEventTap-backed approach as the keyboard listener, so it runs
+    # in its own background thread and doesn't block the main runloop.
+    mouse_listener = _pynput_mouse.Listener(
+        on_click=_mouse_on_click,
+        on_move=_mouse_on_move,
+    )
+    mouse_listener.start()
+    log.info(
+        "mouse trigger: left-click hold≥%dms (move<%.0fpx)",
+        MOUSE_HOLD_MS, MOUSE_MOVE_THRESHOLD_PX,
+    )
 
     global _overlay_controller
     if OVERLAY_ENABLED:
