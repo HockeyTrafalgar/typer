@@ -536,6 +536,12 @@ _persistent_audio_q = queue.Queue()
 _audio_session_active = threading.Event()
 _audio_input_stream = None
 _audio_cb_stats = {"calls": 0, "frames": 0, "status_warns": 0}
+# Last seen callback frame count, used by the heartbeat thread to
+# detect a stream that stopped delivering samples without raising an
+# error (CoreAudio occasionally drops a stream silently — we want to
+# know about it before the next dictation attempt fails).
+_audio_last_seen_frames = 0
+_audio_last_seen_at = 0.0
 
 def _open_persistent_audio_input():
     """Open the mic once on app startup and keep it open for the
@@ -581,6 +587,91 @@ def _drain_persistent_audio_q():
             _persistent_audio_q.get_nowait()
         except queue.Empty:
             return
+
+# ── HEARTBEAT ────────────────────────────────────────────────────────────────
+# Periodic background log that records the health of subsystems we rely
+# on long-running. Specifically what bit me last night: the persistent
+# CoreAudio stream silently stopped delivering callbacks at some point
+# during an overnight run — restart of Typer fixed it. Now we'll see
+# it BEFORE the user tries to dictate.
+HEARTBEAT_INTERVAL_S = float(os.environ.get("TYPER_HEARTBEAT_S", "60"))
+_heartbeat_stop = threading.Event()
+
+def _heartbeat():
+    """Every HEARTBEAT_INTERVAL_S, log a one-line health snapshot.
+    Watches the audio stream for two failure modes:
+      • stream.active flipped to False (CoreAudio dropped it)
+      • stream.active still True but no new callback frames in N
+        seconds (stream is alive but silently producing nothing)
+    Either way, try restarting the stream so the NEXT dictation works."""
+    global _audio_last_seen_frames, _audio_last_seen_at
+    _audio_last_seen_frames = _audio_cb_stats["frames"]
+    _audio_last_seen_at = time.time()
+    while not _heartbeat_stop.wait(HEARTBEAT_INTERVAL_S):
+        try:
+            _do_heartbeat()
+        except Exception:
+            log.exception("heartbeat tick failed")
+
+def _do_heartbeat():
+    global _audio_last_seen_frames, _audio_last_seen_at
+    now = time.time()
+    frames_now = _audio_cb_stats["frames"]
+    calls_now = _audio_cb_stats["calls"]
+    dframes = frames_now - _audio_last_seen_frames
+    age_s = now - _audio_last_seen_at
+    stream_active = (
+        _audio_input_stream is not None
+        and getattr(_audio_input_stream, "active", False)
+    )
+    log.info(
+        "heartbeat: stream_active=%s calls=%d frames=%d Δframes=%d "
+        "(over %.1fs) status_warns=%d session_active=%s queue=%d",
+        stream_active, calls_now, frames_now, dframes, age_s,
+        _audio_cb_stats["status_warns"],
+        _audio_session_active.is_set(),
+        _persistent_audio_q.qsize(),
+    )
+    # Restart logic: only intervene when the stream looks unhealthy.
+    # A perfectly healthy idle stream WILL still tick its callback at
+    # ~10 Hz (we set blocksize to 0.1 s of audio) — if dframes is zero
+    # over a full heartbeat interval, the stream's broken.
+    needs_restart = False
+    if _audio_input_stream is None:
+        needs_restart = True
+        log.warning("heartbeat: persistent audio stream is None — restarting")
+    elif not stream_active:
+        needs_restart = True
+        log.warning("heartbeat: persistent audio stream went inactive — restarting")
+    elif dframes == 0 and age_s >= HEARTBEAT_INTERVAL_S * 0.9:
+        needs_restart = True
+        log.warning(
+            "heartbeat: persistent audio stream stalled "
+            "(no callback frames in %.1fs) — restarting", age_s,
+        )
+    if needs_restart:
+        _restart_persistent_audio_input()
+    _audio_last_seen_frames = frames_now
+    _audio_last_seen_at = now
+
+def _restart_persistent_audio_input():
+    """Close the current persistent audio stream (if any) and re-open
+    a fresh one. Used by the heartbeat watchdog when CoreAudio drops
+    the stream out from under us."""
+    global _audio_input_stream
+    old = _audio_input_stream
+    _audio_input_stream = None
+    if old is not None:
+        try:
+            old.stop()
+            old.close()
+        except Exception:
+            log.debug("old stream close failed", exc_info=True)
+    _open_persistent_audio_input()
+    if _audio_input_stream is not None:
+        log.info("audio stream restarted successfully")
+    else:
+        log.error("audio stream restart FAILED — next session will use fallback")
 
 def _get_vad_model():
     global vad_model
@@ -1107,6 +1198,16 @@ def _do_live_stream():
     a per-session stream only if the persistent one failed to come up.
     """
     log.info("live stream begin")
+    # Health check the persistent stream BEFORE recording. If CoreAudio
+    # silently dropped it since the last session, restart inline so
+    # this session captures audio instead of falling into a 0-frames
+    # session and confusing the user.
+    if (_audio_input_stream is not None
+            and not getattr(_audio_input_stream, "active", False)):
+        log.warning(
+            "live stream begin: persistent stream is inactive — restarting inline"
+        )
+        _restart_persistent_audio_input()
     use_persistent = _audio_input_stream is not None
     if use_persistent:
         audio_q = _persistent_audio_q
@@ -1460,6 +1561,11 @@ def main():
     # the first words of each session.
     _open_persistent_audio_input()
 
+    # Heartbeat watchdog — logs subsystem health every minute and
+    # restarts the persistent audio stream if it silently dies.
+    threading.Thread(target=_heartbeat, daemon=True, name="heartbeat").start()
+    log.info("heartbeat: interval=%.0fs", HEARTBEAT_INTERVAL_S)
+
     # Magic Mouse double-tap-and-hold trigger. Same semantics as
     # Right-⌘: hold to dictate, release to stop. start() returns False
     # if no Magic Mouse is connected or MultitouchSupport can't load —
@@ -1496,6 +1602,7 @@ def main():
             mouse_detector.stop()
         except Exception:
             log.debug("mouse detector stop failed", exc_info=True)
+        _heartbeat_stop.set()
     atexit.register(_cleanup)
 
     # Hard SIGINT / SIGTERM handlers. AppHelper.runEventLoop(installInterrupt

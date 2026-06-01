@@ -96,6 +96,18 @@ if _MT_AVAILABLE:
     _mt.MTDeviceGetFamilyID.argtypes = [c_void_p, POINTER(c_int)]
     _mt.MTRegisterContactFrameCallback.restype = c_int
     _mt.MTRegisterContactFrameCallback.argtypes = [c_void_p, _MTContactCallbackFunction]
+    # Newer-hardware-compatible variant. Same callback signature, takes
+    # an extra void* refcon (we pass NULL). Used by BetterTouchTool to
+    # subscribe to the Apple Silicon Magic Mouse 2 / USB-C variants
+    # where the no-refcon entry point returns rc=1.
+    try:
+        _mt.MTRegisterContactFrameCallbackWithRefcon.restype = c_int
+        _mt.MTRegisterContactFrameCallbackWithRefcon.argtypes = [
+            c_void_p, _MTContactCallbackFunction, c_void_p
+        ]
+        _HAS_REFCON_REG = True
+    except AttributeError:
+        _HAS_REFCON_REG = False
     _mt.MTDeviceStart.restype = c_int
     _mt.MTDeviceStart.argtypes = [c_void_p, c_int]
     _mt.MTDeviceStop.restype = c_int
@@ -164,23 +176,17 @@ class GestureDetector:
 
     # ── public API ──────────────────────────────────────────────────────────
     def start(self):
-        """Open the multitouch framework, find the Magic Mouse, register
-        the frame callback, and spin up a dedicated CFRunLoop thread.
-        Returns True on success, False if no eligible device was found
-        or MultitouchSupport itself isn't available."""
+        """Spin up a dedicated CFRunLoop thread that will open the
+        multitouch framework, find the Magic Mouse, and register the
+        frame callback. Always returns True if MT itself is available
+        — the actual device discovery happens on the worker thread
+        and only logs (a failure there is non-fatal)."""
         if not _MT_AVAILABLE:
-            return False
-        if not self._attach_devices():
-            log.info("mouse trigger: no Magic Mouse detected")
             return False
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="mt-touch"
         )
         self._thread.start()
-        log.info(
-            "mouse trigger active: %d device(s), tap≤%dms gap≤%dms",
-            len(self._devices), self._tap_max_ms, self._double_tap_gap_ms,
-        )
         return True
 
     def stop(self):
@@ -198,18 +204,39 @@ class GestureDetector:
             log.warning("MTDeviceCreateList returned NULL")
             return False
         n = _cf.CFArrayGetCount(devs)
+        log.info("mouse trigger: found %d multitouch device(s)", n)
+        # FIRST PASS — only look at family IDs, defer sensor-dimension
+        # probing until AFTER we've identified the mouse. Calling
+        # MTDeviceGetSensorDimensions on a device we then don't register
+        # appears to leave the framework in a state where the NEXT
+        # device's MTRegisterContactFrameCallback returns rc=1.
         for i in range(n):
             d = _cf.CFArrayGetValueAtIndex(devs, i)
             fam = c_int(-1)
             _mt.MTDeviceGetFamilyID(d, ctypes.byref(fam))
+            if fam.value in _KNOWN_MOUSE_FAMILIES:
+                self._register(d, fam.value, grid=-1)
+        if self._devices:
+            return True
+        # FALLBACK — no family matched; try sensor-dimension heuristic
+        # to catch hardware whose family ID we haven't seen yet.
+        log.info(
+            "mouse trigger: no known-family mouse found, trying sensor-dim heuristic"
+        )
+        for i in range(n):
+            d = _cf.CFArrayGetValueAtIndex(devs, i)
+            fam = c_int(-1)
+            _mt.MTDeviceGetFamilyID(d, ctypes.byref(fam))
+            if fam.value in _KNOWN_MOUSE_FAMILIES:
+                continue  # already tried in pass 1
             grid = self._sensor_cells(d)
-            if not self._looks_like_mouse(fam.value, grid):
+            if 0 < grid <= _SENSOR_GRID_MOUSE_CAP:
+                self._register(d, fam.value, grid)
+            else:
                 log.debug(
                     "mouse trigger: skipping device family=%d grid=%d (not a mouse)",
                     fam.value, grid,
                 )
-                continue
-            self._register(d, fam.value, grid)
         return bool(self._devices)
 
     @staticmethod
@@ -237,6 +264,10 @@ class GestureDetector:
         return False
 
     def _register(self, device, family_id, grid):
+        log.info(
+            "mouse trigger: registering device family=%d grid=%d",
+            family_id, grid,
+        )
         def _cb(d, fingers_ptr, n_fingers, timestamp, frame):
             try:
                 self._on_frame(int(n_fingers))
@@ -245,13 +276,36 @@ class GestureDetector:
             return 0
         ref = _MTContactCallbackFunction(_cb)
         self._cb_refs.append(ref)  # keepalive
-        rc = _mt.MTRegisterContactFrameCallback(device, ref)
+        # Try the WithRefcon variant first (works for modern Magic Mouse
+        # on Apple Silicon); fall back to the plain variant for older
+        # hardware / older macOS where the WithRefcon symbol is absent.
+        rc = 1
+        if _HAS_REFCON_REG:
+            rc = _mt.MTRegisterContactFrameCallbackWithRefcon(device, ref, None)
+            if rc != 0:
+                log.debug(
+                    "MTRegisterContactFrameCallbackWithRefcon rc=%d, "
+                    "falling back to plain MTRegisterContactFrameCallback",
+                    rc,
+                )
         if rc != 0:
-            log.warning("MTRegisterContactFrameCallback failed rc=%d", rc)
+            rc = _mt.MTRegisterContactFrameCallback(device, ref)
+        if rc != 0:
+            log.warning(
+                "register-contact-frame-callback failed rc=%d (device family=%d). "
+                "Probably an entitlement requirement Apple added in macOS 26 "
+                "(Tahoe) for MultitouchSupport — the PyObjC-bundled Python "
+                "binary lacks the private entitlement. Keyboard hotkeys "
+                "continue to work.",
+                rc, family_id,
+            )
             return
         rc = _mt.MTDeviceStart(device, 0)
         if rc != 0:
-            log.warning("MTDeviceStart failed rc=%d", rc)
+            log.warning(
+                "MTDeviceStart failed rc=%d (device family=%d)",
+                rc, family_id,
+            )
             return
         self._devices.append(device)
         log.info(
@@ -261,6 +315,20 @@ class GestureDetector:
 
     # ── run loop ────────────────────────────────────────────────────────────
     def _run_loop(self):
+        # Device discovery + registration must happen on the SAME
+        # thread that will pump the CFRunLoop where MT delivers
+        # contact frames. Doing this on the main thread (the old code
+        # path) caused MTRegisterContactFrameCallback to return rc=1
+        # because the registration is bound to the calling thread's
+        # runloop, which never gets pumped (the main thread runs
+        # AppKit's runloop, not the default-mode one MT uses).
+        if not self._attach_devices():
+            log.info("mouse trigger: no Magic Mouse detected")
+            return
+        log.info(
+            "mouse trigger active: %d device(s), tap≤%dms gap≤%dms",
+            len(self._devices), self._tap_max_ms, self._double_tap_gap_ms,
+        )
         # Drive a short-timeout CFRunLoop. The frame callbacks get
         # dispatched here. The short timeout also lets us tear down
         # cleanly when stop() is called and run periodic state-machine
