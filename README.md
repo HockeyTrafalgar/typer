@@ -1,8 +1,9 @@
 # Typer
 
-Hold-to-talk voice dictation for macOS. Apple Silicon native. Two ASR
-backends to pick from depending on whether you want true low-latency
-streaming or higher accuracy.
+Hold-to-talk voice dictation for macOS. Apple Silicon native, powered by
+[`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper)
+(`mlx-community/whisper-large-v3-mlx`) — state-of-the-art accuracy across
+~99 languages.
 
 > **Hold Right-⌘ → speak → release → text gets pasted into the focused
 > field.** Tap F19 to toggle on/off if you'd rather not hold a key.
@@ -11,22 +12,10 @@ A small floating glass HUD appears next to the focused text caret while
 you talk, showing the live transcript. Press **Esc** to cancel without
 pasting.
 
----
-
-## Two variants
-
-| | [`typer.py`](typer.py) — Parakeet | [`typer_whisper.py`](typer_whisper.py) — Whisper |
-|---|---|---|
-| Model | `mlx-community/parakeet-tdt-0.6b-v3` | `mlx-community/whisper-large-v3-mlx` |
-| Streaming? | **True streaming** — incremental decoder, ~150 ms latency between speech and text in field | Pseudo-streaming — re-transcribes growing buffer each tick, ~1–2 s per refresh |
-| Accuracy | Excellent on EN, very good on the 25 European languages it covers | State-of-the-art across ~99 languages, slightly more robust on accented/noisy speech |
-| First-run download | ~1.2 GB | ~1.5 GB |
-| Floating HUD overlay | No (text streams directly into the field) | Yes — Liquid Glass HUD anchored to the text caret |
-| Best for | "I just want to talk into any text field and have it appear" | "I want batch dictation with a visible preview before commit" |
-| Run | `./run.sh` | `./run_whisper.sh` |
-
-Pick one and stick with it. Both scripts are kept in the repo because
-they take very different approaches to the same problem.
+Whisper isn't a true streaming model, so Typer captures audio into a
+rolling buffer while you hold the key, shows live previews in the HUD,
+and pastes the result in one shot on release (batch mode) — avoiding the
+diff-flicker and stuck-modifier edge cases of true streaming.
 
 ---
 
@@ -43,11 +32,6 @@ cd typer
 pip install -r requirements.txt
 ```
 
-Both backends share most dependencies, but [`requirements.txt`](requirements.txt)
-keeps the variant-specific ones (`mlx-whisper`, `parakeet-mlx`,
-`pyobjc`) grouped — drop whichever you don't need if you want a smaller
-install.
-
 ### macOS permissions
 
 Grant the **venv Python binary** (`./.venv/bin/python3.12`) the
@@ -56,7 +40,7 @@ following permissions in **System Settings → Privacy & Security**:
 | Permission | Why |
 |---|---|
 | **Microphone** | Recording your voice |
-| **Accessibility** | Synthetic keystrokes for paste / backspace, and reading the text-caret position for HUD placement (Whisper variant) |
+| **Accessibility** | Synthetic keystrokes for paste / backspace, and reading the text-caret position for HUD placement |
 | **Input Monitoring** | Global hotkey listener (Right-⌘ / F19) |
 
 The system will prompt the first time each permission is needed —
@@ -67,18 +51,18 @@ accept, then restart the script.
 ## Run
 
 ```bash
-./run_whisper.sh   # or ./run.sh for the Parakeet variant
+./run_whisper.sh
 ```
 
 Hotkeys:
-- **Hold Right-⌘** — record while held, paste on release (batch in Whisper, streaming in Parakeet).
+- **Hold Right-⌘** (or **F18**) — record while held, paste on release.
 - **Tap F19** — toggle on/off (start with first tap, stop with second).
 - **Press Esc** while recording — cancel the session, skip the paste.
 - **Ctrl+C in the terminal** — quit.
 
-The Whisper variant uses Apple's **Liquid Glass** (`NSGlassEffectView`,
-macOS 26+) for the floating HUD when available, falling back to the
-older `NSVisualEffectView` blur on earlier macOS.
+Typer uses Apple's **Liquid Glass** (`NSGlassEffectView`, macOS 26+) for
+the floating HUD when available, falling back to the older
+`NSVisualEffectView` blur on earlier macOS.
 
 ---
 
@@ -91,20 +75,20 @@ touching the source. Most useful knobs:
 
 | Var | Default | Notes |
 |---|---|---|
-| `TYPER_MODEL` | `…/whisper-large-v3-mlx` or `…/parakeet-tdt-0.6b-v3` | Any MLX-hosted Whisper or Parakeet model id |
-| `TYPER_MODE` (Whisper) | `batch` | `batch` — paste once on release; `stream` — diff-paste live |
+| `TYPER_MODEL` | `…/whisper-large-v3-mlx` | Any MLX-hosted Whisper model id (e.g. `…/whisper-large-v3-turbo` for ~3× faster) |
+| `TYPER_MODE` | `batch` | `batch` — paste once on release; `stream` — diff-paste live |
 | `TYPER_WHISPER_LANGUAGE` | unset | `en`, `ru`, … — skip auto-detect |
-| `TYPER_INITIAL_PROMPT` (Whisper) | unset | Vocabulary/style prime — best lever for names & jargon |
-| `TYPER_BEST_OF` (Whisper) | `5` | Number of samples to draw at each fallback temperature |
-| `TYPER_TEMPERATURE` (Whisper) | `0.0,0.2,…,1.0` | Whisper fallback temperatures |
+| `TYPER_INITIAL_PROMPT` | unset | Vocabulary/style prime — best lever for names & jargon |
+| `TYPER_BEST_OF` | `5` | Number of samples to draw at each fallback temperature |
+| `TYPER_TEMPERATURE` | `0.0,0.2,…,1.0` | Whisper fallback temperatures |
 | `TYPER_HF_OFFLINE` | `1` when cache exists | Skip HuggingFace API check on startup |
 
 ### Latency
 
 | Var | Default | Notes |
 |---|---|---|
-| `TYPER_PUSH_S` | `0.35` (Whisper) / `0.5` (Parakeet) | Minimum interval between transcribe ticks |
-| `TYPER_MAX_BUFFER_S` (Whisper) | `28.0` | Cap on rolling audio buffer (Whisper context is 30 s) |
+| `TYPER_PUSH_S` | `0.35` | Minimum interval between transcribe ticks |
+| `TYPER_MAX_BUFFER_S` | `28.0` | Cap on rolling audio buffer (Whisper context is 30 s) |
 
 ### VAD (voice activity detection)
 
@@ -115,7 +99,7 @@ touching the source. Most useful knobs:
 | `TYPER_VAD_HANGOVER_MS` | `400` | Silence required to mark end of utterance |
 | `TYPER_VAD_RMS_FLOOR` | `0.005` | Minimum RMS energy before VAD even runs |
 
-### Overlay HUD (Whisper variant)
+### Overlay HUD
 
 | Var | Default | Notes |
 |---|---|---|
@@ -136,21 +120,14 @@ touching the source. Most useful knobs:
 | `TYPER_LOG_LEVEL` | `DEBUG` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `TYPER_LOG_DIR` | `./logs` | Log files rotate at 5 MB × 5 |
 
-Read the top of [`typer_whisper.py`](typer_whisper.py) /
-[`typer.py`](typer.py) for the full list of knobs and what they do.
+Read the top of [`typer_whisper.py`](typer_whisper.py) for the full list
+of knobs and what they do.
 
 ---
 
 ## How it works
 
-**Parakeet variant.** A `sounddevice` mic stream feeds Silero VAD,
-which gates out silence. Voiced audio goes through Parakeet-MLX's
-streaming decoder. Every tick, the new full transcript is diffed against
-what's already in the focused field — diverged tails are erased with
-backspaces and the corrected tail is pasted. So self-corrections by the
-decoder are reflected in place rather than duplicated.
-
-**Whisper variant.** Whisper isn't a true streaming model, so we
+Whisper isn't a true streaming model, so we
 approximate it: while you hold Right-⌘, audio is captured into a
 rolling buffer and a Liquid-Glass HUD shows live previews from
 re-transcribing the buffer every tick. On release we either reuse the
@@ -167,7 +144,7 @@ fallback to the mouse cursor when the focused app doesn't expose it.
 
 - While holding Right-⌘, don't click into a different field — synthetic
   keystrokes always go wherever the cursor is.
-- The Whisper HUD anchors to the caret on most native macOS text fields
+- The HUD anchors to the caret on most native macOS text fields
   (Safari, Chrome inputs, Notes, TextEdit, terminals, most Electron
   apps). Some GPU-rendered text views don't expose `AXBoundsForRange`;
   the HUD falls back to mouse-cursor placement.
@@ -175,8 +152,8 @@ fallback to the mouse cursor when the focused app doesn't expose it.
   app, enable **System Settings → Keyboard → "Use F1, F2, etc. keys as
   standard function keys"** (or remap to a key you don't use, e.g. F13).
 - Tail words you spoke in the last ~0.4 s before release might be cut
-  from the paste in Whisper batch mode — adjust `TYPER_PUSH_S` lower if
-  this bites you.
+  from the paste in batch mode — adjust `TYPER_PUSH_S` lower if this
+  bites you.
 
 ---
 
@@ -190,7 +167,6 @@ the diff you'll see Co-Authored-By trailers crediting the assist.
 
 Upstream credit:
 - [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper) — Whisper on MLX
-- [`parakeet-mlx`](https://github.com/senstella/parakeet-mlx) — Parakeet on MLX
 - [`silero-vad`](https://github.com/snakers4/silero-vad) — voice activity detection
 
 ## License

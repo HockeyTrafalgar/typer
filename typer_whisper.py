@@ -3,16 +3,15 @@
 Typer — Hold-to-Talk Live Typing (Whisper-MLX, Apple Silicon native)
 
 Hold Right-⌘ → speak → words stream into the focused field in near real time;
-release to stop. Or tap F19 to toggle dictation on/off.
+release to stop (Right-⌘ or F18). Or tap F19 to toggle dictation on/off.
 
 Model: mlx-community/whisper-large-v3-mlx via mlx-whisper — multilingual
        (~99 languages) with automatic language detection, native Apple
-       Silicon. Whisper is NOT a true streaming model the way Parakeet
-       is, so we approximate streaming by re-transcribing a growing
-       voiced-audio buffer every push interval and diff-pasting the new
-       suffix into the focused field. This is heavier per tick than
-       Parakeet but typically more accurate, especially on accented or
-       noisy speech.
+       Silicon. Whisper is NOT a true streaming model, so we approximate
+       streaming by re-transcribing a growing voiced-audio buffer every
+       push interval and (in stream mode) diff-pasting the new suffix
+       into the focused field. The default batch mode instead captures
+       the whole utterance and pastes once on release.
 
 Requirements: mlx-whisper, pynput, pyperclip, sounddevice, numpy,
               silero-vad, onnxruntime, torch
@@ -73,11 +72,6 @@ from pynput import mouse as _pynput_mouse
 import mlx_whisper
 from silero_vad import load_silero_vad
 
-# Magic Mouse double-tap-and-hold gesture detector. Lives in its own
-# module because it pokes a private Apple framework via ctypes and is
-# allowed to fail without breaking the rest of the app.
-from typer_mouse import GestureDetector as _MouseGestureDetector
-
 # AppKit (PyObjC) drives the live-transcription overlay HUD. NSPanel with
 # becomesKeyOnlyIfNeeded + nonactivating behavior is the only way to get a
 # floating window on macOS that NEVER steals focus from the user's app —
@@ -91,14 +85,14 @@ from AppKit import (
     NSWindowCollectionBehaviorStationary,
     NSWindowCollectionBehaviorIgnoresCycle,
     NSVisualEffectView,
-    NSVisualEffectMaterialHUDWindow, NSVisualEffectMaterialPopover,
+    NSVisualEffectMaterialPopover,
     NSVisualEffectBlendingModeBehindWindow,
     NSVisualEffectStateActive,
     NSFontWeightRegular,
     NSViewWidthSizable, NSViewHeightSizable,
-    NSAppearance, NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight,
+    NSAppearance, NSAppearanceNameVibrantLight,
     NSImage, NSBezierPath, NSEdgeInsetsMake, NSImageResizingModeStretch,
-    NSImageView, NSImageSymbolConfiguration, NSTextAlignmentCenter,
+    NSImageView, NSImageSymbolConfiguration,
     NSFontAttributeName,
     NSLineBreakByWordWrapping, NSStringDrawingUsesLineFragmentOrigin,
 )
@@ -112,16 +106,14 @@ try:
     from AppKit import (
         NSGlassEffectView,
         NSGlassEffectViewStyleRegular,
-        NSGlassEffectViewStyleClear,
     )
     _LIQUID_GLASS_AVAILABLE = True
 except ImportError:
     NSGlassEffectView = None
     NSGlassEffectViewStyleRegular = None
-    NSGlassEffectViewStyleClear = None
     _LIQUID_GLASS_AVAILABLE = False
 from Quartz import kCACornerCurveContinuous
-from Foundation import NSObject
+from Foundation import NSObject, NSUserDefaults
 from PyObjCTools import AppHelper
 
 # Accessibility API — used to locate the text caret of the focused field
@@ -215,13 +207,27 @@ WHISPER_HALLUCINATION_SILENCE_S = os.environ.get("TYPER_HALLUCINATION_SILENCE_S"
 WHISPER_CONDITION_ON_PREV = os.environ.get("TYPER_CONDITION_ON_PREV", "1") == "1"
 # Optional vocabulary/style prime fed to every transcription call. Use
 # this to bias toward names, jargon, or formatting Whisper otherwise
-# mangles (e.g. "Tokens used: pynput, MLX, Parakeet, Whisper.").
+# mangles (e.g. "Tokens used: pynput, MLX, Whisper, Silero.").
 WHISPER_INITIAL_PROMPT = os.environ.get("TYPER_INITIAL_PROMPT", "") or None
 
 # Hard cap on the rolling buffer fed to Whisper each tick. Whisper's
 # context is 30 s; beyond that the model windows internally and gets
 # slower per call. We cap a bit under that to keep latency bounded.
 MAX_BUFFER_S = float(os.environ.get("TYPER_MAX_BUFFER_S", "28.0"))
+
+# Chunked commit. Whisper can't see audio older than the rolling buffer, so
+# for dictation longer than the cap we'd otherwise lose the beginning. Once
+# the live buffer grows past COMMIT_AT_SILENCE_S *and* VAD reports we're in a
+# silence gap (a clean segment boundary), we transcribe the buffer, append
+# the text to a committed transcript, and clear the buffer. The buffer never
+# exceeds MAX_BUFFER_S; the final paste is committed_text + the live tail, so
+# arbitrarily long dictation survives in full. Keep this comfortably under
+# MAX_BUFFER_S so there's room to wait for a silence boundary before the hard
+# cap forces a (possibly mid-word) flush.
+COMMIT_AT_SILENCE_S = float(os.environ.get("TYPER_COMMIT_AT_SILENCE_S", "18.0"))
+# How much of the committed transcript's tail to feed back as Whisper's
+# initial_prompt when transcribing the live buffer, for cross-flush coherence.
+COMMIT_CONTEXT_CHARS = int(os.environ.get("TYPER_COMMIT_CONTEXT_CHARS", "200"))
 
 # Minimum voiced-audio duration before we run a PREVIEW transcribe.
 # Whisper happily hallucinates plausible text on tiny chunks ("Thank
@@ -362,7 +368,12 @@ live_cancel_event = threading.Event()
 live_state_lock  = threading.Lock()
 
 f19_held         = False
+f18_held         = False
 rcmd_held        = False
+# "Latched"/permanent mode: set when F19 is tapped while F18 is still held.
+# Once latched, releasing F18 does NOT stop dictation — only another F19 tap
+# does. Reset whenever a session starts or stops.
+latched          = False
 
 # Single inference thread services jobs; MLX tensors stay on one thread.
 inference_q = queue.Queue()
@@ -378,8 +389,13 @@ _WHISPER_HALLUCINATION_SILENCE_PARSED = (
     float(WHISPER_HALLUCINATION_SILENCE_S) if WHISPER_HALLUCINATION_SILENCE_S else None
 )
 
-def _whisper_transcribe(audio_f32):
-    """Run mlx_whisper.transcribe on a float32 mono 16 kHz array, return text."""
+def _whisper_transcribe(audio_f32, initial_prompt=None):
+    """Run mlx_whisper.transcribe on a float32 mono 16 kHz array, return text.
+
+    `initial_prompt`, when given, overrides the global TYPER_INITIAL_PROMPT
+    for this call. Used by the chunked-commit path to feed the tail of the
+    already-committed transcript as context, so spelling/style stays
+    consistent across a buffer flush."""
     kwargs = dict(
         path_or_hf_repo=MODEL_ID,
         temperature=_WHISPER_TEMPERATURE_PARSED,
@@ -392,8 +408,9 @@ def _whisper_transcribe(audio_f32):
     )
     if WHISPER_LANGUAGE:
         kwargs["language"] = WHISPER_LANGUAGE
-    if WHISPER_INITIAL_PROMPT:
-        kwargs["initial_prompt"] = WHISPER_INITIAL_PROMPT
+    prompt = initial_prompt if initial_prompt is not None else WHISPER_INITIAL_PROMPT
+    if prompt:
+        kwargs["initial_prompt"] = prompt
     if _WHISPER_HALLUCINATION_SILENCE_PARSED is not None:
         kwargs["hallucination_silence_threshold"] = _WHISPER_HALLUCINATION_SILENCE_PARSED
         kwargs["word_timestamps"] = True  # required for silence detection
@@ -651,7 +668,16 @@ def _do_heartbeat():
             "(no callback frames in %.1fs) — restarting", age_s,
         )
     if needs_restart:
-        _restart_persistent_audio_input()
+        # Never swap the stream out from under an in-flight dictation —
+        # _do_live_stream holds a reference to the live stream/queue and a
+        # mid-session restart would drop the audio it's actively draining.
+        # The session is delivering frames anyway, so a genuine stall here
+        # is unlikely; defer any restart to the next idle heartbeat.
+        if _audio_session_active.is_set():
+            log.warning("heartbeat: stream looks unhealthy but a dictation "
+                        "session is active — deferring restart")
+        else:
+            _restart_persistent_audio_input()
     _audio_last_seen_frames = frames_now
     _audio_last_seen_at = now
 
@@ -715,6 +741,37 @@ def _rounded_mask_image(radius):
     img.setCapInsets_(NSEdgeInsetsMake(radius, radius, radius, radius))
     img.setResizingMode_(NSImageResizingModeStretch)
     return img
+
+
+def _overlay_is_dark():
+    """True when macOS is in Dark Mode. The Liquid Glass surface inherits
+    the system appearance, so on a dark desktop the HUD material turns
+    dark and our near-black ink would be invisible against it.
+
+    AppleInterfaceStyle is "Dark" in Dark Mode and absent (None) in Light
+    Mode — the canonical, view-independent signal. We fall back to the
+    app's effective appearance name if the default can't be read."""
+    try:
+        style = NSUserDefaults.standardUserDefaults().stringForKey_(
+            "AppleInterfaceStyle"
+        )
+        if style is not None:
+            return "dark" in style.lower()
+    except Exception:
+        pass
+    try:
+        name = NSApp.effectiveAppearance().name()
+        return "Dark" in str(name)
+    except Exception:
+        return False
+
+
+def _overlay_ink_color(alpha=0.55):
+    """Ink color for the HUD text + mic icon. Near-black on a light
+    surface, near-white on a dark one, so the transcript stays legible
+    regardless of the system theme."""
+    white = 1.0 if _overlay_is_dark() else 0.0
+    return NSColor.colorWithCalibratedWhite_alpha_(white, alpha)
 
 def _caret_screen_rect():
     """Return (x, y, w, h) of the focused-app's text caret in NSScreen
@@ -853,7 +910,10 @@ class _OverlayController(NSObject):
             bg.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
             bg.setState_(NSVisualEffectStateActive)
             bg.setAppearance_(
-                NSAppearance.appearanceNamed_(NSAppearanceNameVibrantLight)
+                NSAppearance.appearanceNamed_(
+                    NSAppearanceNameVibrantDark if _overlay_is_dark()
+                    else NSAppearanceNameVibrantLight
+                )
             )
             bg.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             bg.setMaskImage_(_rounded_mask_image(OVERLAY_CORNER_RADIUS))
@@ -902,9 +962,7 @@ class _OverlayController(NSObject):
         if mic_img is not None:
             mic_view.setImage_(mic_img)
         try:
-            mic_view.setContentTintColor_(
-                NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
-            )
+            mic_view.setContentTintColor_(_overlay_ink_color(0.55))
         except Exception:
             pass
         content.addSubview_(mic_view)
@@ -930,9 +988,7 @@ class _OverlayController(NSObject):
         self.label.setFont_(
             NSFont.systemFontOfSize_weight_(OVERLAY_FONT_SIZE, NSFontWeightRegular)
         )
-        self.label.setTextColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
-        )
+        self.label.setTextColor_(_overlay_ink_color(0.55))
         self.label.setStringValue_("")
         cell = self.label.cell()
         cell.setLineBreakMode_(NSLineBreakByWordWrapping)
@@ -1000,8 +1056,16 @@ class _OverlayController(NSObject):
         # Both placeholder and live-transcript text share the SAME hue
         # as the mic icon (black @ 55% alpha) for a single, calm
         # typographic voice across the whole HUD.
-        color = NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55)
+        color = _overlay_ink_color(0.55)
         self.label.setTextColor_(color)
+        # Re-tint the mic each render too: the icon's tint is otherwise
+        # fixed at init, so a live Light↔Dark theme switch (or launching
+        # in a different theme than the current one) would leave it stale.
+        if getattr(self, "_mic", None) is not None:
+            try:
+                self._mic.setContentTintColor_(color)
+            except Exception:
+                pass
         self.label.setStringValue_(text)
         self._resize_to_fit(text)
 
@@ -1160,16 +1224,38 @@ def _paste_text(text):
     if not text:
         return
     log.debug("paste %d chars: %r", len(text), text)
+    # Preserve whatever the user already had on the clipboard; pasting via
+    # Cmd+V requires us to commandeer it, but a dictation tool that pastes
+    # constantly shouldn't silently destroy the user's copy buffer.
+    try:
+        prev_clip = pyperclip.paste()
+    except Exception:
+        prev_clip = None
     pyperclip.copy(text)
     time.sleep(0.03)
     _release_modifiers()
     with _kbd.pressed(keyboard.Key.cmd):
         _kbd.press('v')
         _kbd.release('v')
+    # Restore the original clipboard after the paste has been delivered.
+    # Small delay so the synthetic Cmd+V reads our text, not the restored
+    # value, before we put the user's content back.
+    if prev_clip is not None:
+        time.sleep(0.05)
+        try:
+            pyperclip.copy(prev_clip)
+        except Exception:
+            log.debug("clipboard restore failed", exc_info=True)
 
 def _emit_diff(current, last):
     """Backspace over the diverged tail of `last`, paste the new tail of
-    `current`. Returns the canonical text now in the field."""
+    `current`. Returns the canonical text now in the field.
+
+    WARNING (stream mode only): this assumes the focused field still holds
+    exactly `last`. It backspaces `len(last) - common_prefix` characters
+    blindly, so if the user types into the field between ticks — or moves
+    the caret — those keystrokes will be eaten by the next diff. Batch mode
+    (the default) avoids this entirely by pasting once on release."""
     n = min(len(current), len(last))
     i = 0
     while i < n and current[i] == last[i]:
@@ -1243,10 +1329,27 @@ def _do_live_stream():
         log.exception("VAD init failed, falling back to raw audio (hallucinations possible)")
 
     last_pasted = ""       # only used in stream mode (diff state)
-    last_preview = ""      # what's currently shown in the overlay
+    last_preview = ""      # whisper text for the CURRENT live buffer only
+    committed_text = ""    # transcript of segments already flushed out of buf
     iters = 0
     max_buf_samples = int(MAX_BUFFER_S * SAMPLE_RATE)
+    commit_buf_samples = int(COMMIT_AT_SILENCE_S * SAMPLE_RATE)
     voiced_buf = np.zeros(0, dtype=np.float32)
+
+    def _join(a, b):
+        """Concatenate two transcript fragments with exactly one space."""
+        a, b = a.rstrip(), b.strip()
+        if a and b:
+            return a + " " + b
+        return a or b
+
+    def _commit_context():
+        """Tail of the committed transcript, fed to Whisper as initial_prompt
+        so the live buffer's transcription stays coherent across a flush.
+        Returns None when there's nothing committed yet (use global prompt)."""
+        if not committed_text:
+            return None
+        return committed_text[-COMMIT_CONTEXT_CHARS:]
 
     def _ingest_audio():
         """Drain the audio queue into voiced_buf (with VAD gating).
@@ -1269,7 +1372,12 @@ def _do_live_stream():
         log.debug("drain: raw=%d voiced=%d (%.2fs voiced)",
                   raw_n, len(samples), len(samples) / SAMPLE_RATE)
         voiced_buf = np.concatenate([voiced_buf, samples])
-        if len(voiced_buf) > max_buf_samples:
+        # Batch mode bounds the buffer via the chunked-commit path
+        # (_maybe_commit), which flushes completed segments out at silence
+        # boundaries WITHOUT discarding audio Whisper never saw. Legacy
+        # stream mode has no committed-text accumulator and diff-pastes each
+        # tick, so it keeps the old lossy cap-drop to bound the buffer.
+        if TYPER_MODE == "stream" and len(voiced_buf) > max_buf_samples:
             drop = len(voiced_buf) - max_buf_samples
             log.debug("buffer cap hit, dropping %d oldest samples", drop)
             voiced_buf = voiced_buf[drop:]
@@ -1283,7 +1391,7 @@ def _do_live_stream():
             return None
         t_infer = time.time()
         try:
-            text = _whisper_transcribe(voiced_buf)
+            text = _whisper_transcribe(voiced_buf, initial_prompt=_commit_context())
         except Exception:
             log.exception("whisper transcribe failed this tick")
             return None
@@ -1302,6 +1410,41 @@ def _do_live_stream():
         "preview_buf_samples": 0,   # voiced_buf length at last successful preview
     }
     REUSE_PREVIEW_THRESHOLD_SAMPLES = int(0.4 * SAMPLE_RATE)
+
+    def _maybe_commit(text):
+        """Batch mode only. Flush the live buffer into committed_text when it
+        has grown past COMMIT_AT_SILENCE_S and VAD says we're in a silence
+        gap (a clean segment boundary), reusing the preview `text` we already
+        transcribed this tick — no extra inference. A hard cap at
+        MAX_BUFFER_S force-flushes even mid-speech so the buffer (and Whisper
+        latency) never runs away during a long pause-free utterance; that
+        rare case may cut a word, which is unavoidable given Whisper's ~30 s
+        context. After a flush the buffer is empty and the next tick starts
+        fresh, conditioned on the committed tail via _commit_context()."""
+        nonlocal committed_text, last_preview, voiced_buf
+        if TYPER_MODE == "stream":
+            return
+        n = len(voiced_buf)
+        at_silence = (gate is None) or (not gate.in_speech)
+        over_soft = n >= commit_buf_samples and at_silence
+        over_hard = n >= max_buf_samples
+        if not (over_soft or over_hard):
+            return
+        if not text.strip():
+            # Nothing worth committing (e.g. buffer is all hangover silence).
+            # Only clear if we're slamming the hard cap, to avoid runaway.
+            if over_hard:
+                voiced_buf = np.zeros(0, dtype=np.float32)
+                last_preview = ""
+                state["preview_buf_samples"] = 0
+            return
+        committed_text = _join(committed_text, text)
+        log.debug("commit flush: +%d chars (buf=%.2fs, %s); committed=%d chars",
+                  len(text), n / SAMPLE_RATE,
+                  "silence" if over_soft else "hard-cap", len(committed_text))
+        voiced_buf = np.zeros(0, dtype=np.float32)
+        last_preview = ""
+        state["preview_buf_samples"] = 0
 
     def _tick_preview():
         """Per-interval tick during recording. Ingests audio, runs a
@@ -1331,10 +1474,15 @@ def _do_live_stream():
             if text != last_pasted:
                 last_pasted = _emit_diff(text, last_pasted)
             return
-        # batch mode: update overlay only.
+        # batch mode: update overlay only. Show the full running transcript
+        # (already-committed segments + the live buffer) so long dictation
+        # doesn't look like it resets each time the buffer is flushed.
         if text != last_preview:
             last_preview = text
-            overlay_set_text(text)
+            overlay_set_text(_join(committed_text, text))
+        # Flush the buffer into committed_text if it's grown long enough and
+        # we're at a silence boundary, reusing this tick's transcription.
+        _maybe_commit(text)
 
     def _commit_final():
         """Called after the user releases. In batch mode we want the
@@ -1368,14 +1516,22 @@ def _do_live_stream():
                 max(0, new_samples) / SAMPLE_RATE,
                 (time.time() - t0) * 1000.0,
             )
-        if text is None:
-            overlay_hide()
-            return
         if TYPER_MODE == "stream":
+            if text is None:
+                overlay_hide()
+                return
             if text != last_pasted:
                 last_pasted = _emit_diff(text, last_pasted)
         else:
-            # batch mode: paste the entire final transcript in one shot.
+            # batch mode: paste the ENTIRE transcript in one shot — the
+            # segments already flushed into committed_text PLUS this final
+            # buffer tail. (text may be None/empty if the user released right
+            # after a flush left the buffer empty; committed_text still
+            # carries everything dictated so far.)
+            full = _join(committed_text, text or "")
+            if not full:
+                overlay_hide()
+                return
             # Overlay shows it briefly so the user can confirm before it
             # disappears. We hide AFTER the paste so a slow paste doesn't
             # leave a stale-looking overlay.
@@ -1383,11 +1539,9 @@ def _do_live_stream():
             # Append a trailing space so two back-to-back dictation
             # sessions don't stick together (e.g. "hello there" then
             # "how are you" would otherwise paste as
-            # "hello therehow are you"). Strip first to avoid
-            # double-spacing if whisper already produced a trailing
-            # space, then add exactly one.
-            payload = text.rstrip() + " "
-            overlay_set_text(text)
+            # "hello therehow are you").
+            payload = full + " "
+            overlay_set_text(full)
             _paste_text(payload)
             last_pasted = payload
         overlay_hide()
@@ -1443,7 +1597,7 @@ def _do_live_stream():
             # Stop the callback from collecting more samples; the
             # persistent stream itself stays OPEN for the next session.
             _audio_session_active.clear()
-            if not use_persistent and 'fallback_stream' in dir():
+            if not use_persistent and 'fallback_stream' in locals():
                 try:
                     fallback_stream.stop()
                     fallback_stream.close()
@@ -1464,11 +1618,12 @@ def _do_live_stream():
 
 # ── LIVE START/STOP ──────────────────────────────────────────────────────────
 def start_live_dictation():
-    global live_active
+    global live_active, latched
     with live_state_lock:
         if live_active:
             log.debug("start_live_dictation: already active, ignoring")
             return
+        latched = False  # fresh session is never latched
         if not model_ready.is_set() or not model_ok:
             log.warning("model not loaded; ignoring start")
             return
@@ -1479,12 +1634,13 @@ def start_live_dictation():
     inference_q.put(("live",))
 
 def stop_live_dictation():
-    global live_active
+    global live_active, latched
     with live_state_lock:
         if not live_active:
             log.debug("stop_live_dictation: not active, ignoring")
             return
         live_active = False
+        latched = False
         live_stop_event.set()
     log.info("✅ stopped")
 
@@ -1506,33 +1662,65 @@ def _toggle_live():
         start_live_dictation()
 
 def on_press(key):
-    global f19_held, rcmd_held
+    global f19_held, f18_held, rcmd_held, latched
+    # NOTE: start/stop/toggle are invoked INLINE on the listener thread (not
+    # dispatched to short-lived daemon threads). They only flip an Event and
+    # enqueue a job — microsecond operations — so they never stall the event
+    # tap. Running them inline guarantees that a press's start always happens
+    # before the matching release's stop; the old per-event-thread dispatch
+    # could reorder them and leave a session stuck "on".
     if key == keyboard.Key.cmd_r:
         if not rcmd_held:
             rcmd_held = True
             log.debug("right-cmd press → hold-to-talk start")
-            threading.Thread(target=start_live_dictation, daemon=True,
-                             name="start-live").start()
+            start_live_dictation()
+    elif key == keyboard.Key.f18:
+        # Hold-to-talk, like right-cmd: hold F18 to dictate, release to stop.
+        if not f18_held:
+            f18_held = True
+            log.debug("F18 press → hold-to-talk start")
+            start_live_dictation()
     elif key == keyboard.Key.f19:
         if not f19_held:
             f19_held = True
-            log.debug("F19 press → toggle (active=%s)", live_active)
-            threading.Thread(target=_toggle_live, daemon=True,
-                             name="toggle-live").start()
+            if f18_held and not latched:
+                # F19 tapped while F18 is still held → latch the active
+                # hold-to-talk session into permanent mode. Releasing F18
+                # will no longer stop it; only another F19 tap will.
+                latched = True
+                log.debug("F19 while F18 held → permanent (latched) mode")
+            elif latched:
+                # Second F19 tap ends a latched session.
+                log.debug("F19 press → stop (was latched)")
+                stop_live_dictation()
+            else:
+                log.debug("F19 press → toggle (active=%s)", live_active)
+                _toggle_live()
     elif key == keyboard.Key.esc and live_active:
         # The "esc" pill in the HUD advertises this — cancel the
         # in-flight session, drop the captured audio, don't paste.
         log.debug("Esc press → cancel dictation")
-        threading.Thread(target=cancel_live_dictation, daemon=True,
-                         name="cancel-live").start()
+        cancel_live_dictation()
 
 def on_release(key):
-    global f19_held, rcmd_held
+    global f19_held, f18_held, rcmd_held
     if key == keyboard.Key.cmd_r:
         rcmd_held = False
         log.debug("right-cmd release → hold-to-talk stop")
-        threading.Thread(target=stop_live_dictation, daemon=True,
-                         name="stop-live").start()
+        stop_live_dictation()
+    elif key == keyboard.Key.f18:
+        f18_held = False
+        if latched:
+            # Session was latched into permanent mode via F19 — keep
+            # dictating; only another F19 tap stops it.
+            log.debug("F18 release ignored (latched/permanent mode)")
+        else:
+            # Hide the HUD immediately on release so it feels instant; the
+            # final transcription + paste still runs in the background in
+            # _commit_final (which won't re-show the now-hidden panel).
+            overlay_hide()
+            log.debug("F18 release → hold-to-talk stop")
+            stop_live_dictation()
     elif key == keyboard.Key.f19:
         f19_held = False
         log.debug("F19 release (no-op for toggle)")
@@ -1544,6 +1732,9 @@ def on_release(key):
 # trigger so normal click-and-drag (text selection, window drag) keeps
 # working unchanged. Uses pynput's public CGEventTap-backed listener —
 # no private API, no entitlements needed.
+# Left-click long-press trigger is OFF by default — it competes with normal
+# clicking. Set TYPER_MOUSE_CLICK_TRIGGER=1 to re-enable it.
+MOUSE_CLICK_TRIGGER_ENABLED = os.environ.get("TYPER_MOUSE_CLICK_TRIGGER", "0") == "1"
 MOUSE_HOLD_MS = int(os.environ.get("TYPER_MOUSE_HOLD_MS", "700"))
 MOUSE_MOVE_THRESHOLD_PX = float(os.environ.get("TYPER_MOUSE_MOVE_PX", "5"))
 
@@ -1570,8 +1761,7 @@ def _mouse_hold_timer_fire():
             return  # defensive — shouldn't happen
         _mouse_click_state["fired_start"] = True
     log.debug("mouse left-click long-press → hold-to-talk start")
-    threading.Thread(target=start_live_dictation, daemon=True,
-                     name="mouse-start-live").start()
+    start_live_dictation()
 
 def _mouse_on_click(x, y, button, pressed):
     if button != _pynput_mouse.Button.left:
@@ -1603,8 +1793,7 @@ def _mouse_on_click(x, y, button, pressed):
             _mouse_click_state["fired_start"] = False
         if fired:
             log.debug("mouse release → hold-to-talk stop")
-            threading.Thread(target=stop_live_dictation, daemon=True,
-                             name="mouse-stop-live").start()
+            stop_live_dictation()
 
 def _mouse_on_move(x, y):
     # Hot path: on_move fires constantly as the cursor wanders. Bail
@@ -1631,7 +1820,7 @@ def main():
 ╔══════════════════════════════════════════════╗
 ║   Typer — Whisper-MLX live typing           ║
 ╠══════════════════════════════════════════════╣
-║  Hold Right-⌘ → speak → release to stop     ║
+║  Hold Right-⌘ or F18 → speak → release      ║
 ║  Tap F19 → start, tap again → stop          ║
 ║  Ctrl+C to quit                              ║
 ╚══════════════════════════════════════════════╝
@@ -1655,22 +1844,7 @@ def main():
     threading.Thread(target=_heartbeat, daemon=True, name="heartbeat").start()
     log.info("heartbeat: interval=%.0fs", HEARTBEAT_INTERVAL_S)
 
-    # Magic Mouse double-tap-and-hold trigger. Same semantics as
-    # Right-⌘: hold to dictate, release to stop. start() returns False
-    # if no Magic Mouse is connected or MultitouchSupport can't load —
-    # we just log it and keep the keyboard triggers running.
-    def _mouse_press_start():
-        log.debug("mouse double-tap-hold start")
-        threading.Thread(target=start_live_dictation, daemon=True,
-                         name="mouse-start-live").start()
-    def _mouse_press_end():
-        log.debug("mouse double-tap-hold release")
-        threading.Thread(target=stop_live_dictation, daemon=True,
-                         name="mouse-stop-live").start()
-    mouse_detector = _MouseGestureDetector(_mouse_press_start, _mouse_press_end)
-    mouse_detector.start()
-
-    log.info("🟢 ready (mode=%s). Hold Right-⌘ to talk, or tap F19 to toggle.",
+    log.info("🟢 ready (mode=%s). Hold Right-⌘ or F18 to talk, or tap F19 to toggle.",
              TYPER_MODE)
 
     def _cleanup():
@@ -1687,10 +1861,6 @@ def main():
                 _audio_input_stream.close()
             except Exception:
                 log.debug("audio stream close failed", exc_info=True)
-        try:
-            mouse_detector.stop()
-        except Exception:
-            log.debug("mouse detector stop failed", exc_info=True)
         _heartbeat_stop.set()
     atexit.register(_cleanup)
 
@@ -1726,15 +1896,22 @@ def main():
     # Mouse listener for the left-click long-press trigger. Same
     # CGEventTap-backed approach as the keyboard listener, so it runs
     # in its own background thread and doesn't block the main runloop.
-    mouse_listener = _pynput_mouse.Listener(
-        on_click=_mouse_on_click,
-        on_move=_mouse_on_move,
-    )
-    mouse_listener.start()
-    log.info(
-        "mouse trigger: left-click hold≥%dms (move<%.0fpx)",
-        MOUSE_HOLD_MS, MOUSE_MOVE_THRESHOLD_PX,
-    )
+    # Disabled by default (TYPER_MOUSE_CLICK_TRIGGER) so it doesn't catch
+    # ordinary clicks.
+    mouse_listener = None
+    if MOUSE_CLICK_TRIGGER_ENABLED:
+        mouse_listener = _pynput_mouse.Listener(
+            on_click=_mouse_on_click,
+            on_move=_mouse_on_move,
+        )
+        mouse_listener.start()
+        log.info(
+            "mouse trigger: left-click hold≥%dms (move<%.0fpx)",
+            MOUSE_HOLD_MS, MOUSE_MOVE_THRESHOLD_PX,
+        )
+    else:
+        log.info("mouse trigger: left-click long-press DISABLED "
+                 "(set TYPER_MOUSE_CLICK_TRIGGER=1 to enable)")
 
     global _overlay_controller
     if OVERLAY_ENABLED:
