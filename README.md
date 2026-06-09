@@ -2,20 +2,24 @@
 
 Hold-to-talk voice dictation for macOS. Apple Silicon native, powered by
 [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper)
-(`mlx-community/whisper-large-v3-mlx`) — state-of-the-art accuracy across
-~99 languages.
+(`mlx-community/whisper-large-v3-turbo`) — fast, accurate transcription
+across ~99 languages.
 
 > **Hold Right-⌘ → speak → release → text gets pasted into the focused
 > field.** Tap F19 to toggle on/off if you'd rather not hold a key.
 
 A small floating glass HUD appears next to the focused text caret while
-you talk, showing the live transcript. Press **Esc** to cancel without
-pasting.
+you talk, with a live mic-activity meter so you can see the microphone is
+picking up sound. Press **Esc** to cancel without pasting.
 
-Whisper isn't a true streaming model, so Typer captures audio into a
-rolling buffer while you hold the key, shows live previews in the HUD,
-and pastes the result in one shot on release (batch mode) — avoiding the
-diff-flicker and stuck-modifier edge cases of true streaming.
+Whisper isn't a streaming model, so by default Typer is **true
+push-to-talk**: while you hold the key it just accumulates voice-activity-
+gated audio (no transcription), then transcribes the whole utterance **once**
+on release and pastes it. This is the design popular local Whisper dictation
+tools use (Handy, WhisperWriter) — it sidesteps the silence hallucinations
+("Thank you", "Thanks for watching") and post-release lag that come from
+re-transcribing a growing buffer. A live-streaming mode is available too
+(see `TYPER_MODE`).
 
 ---
 
@@ -75,19 +79,21 @@ touching the source. Most useful knobs:
 
 | Var | Default | Notes |
 |---|---|---|
-| `TYPER_MODEL` | `…/whisper-large-v3-mlx` | Any MLX-hosted Whisper model id (e.g. `…/whisper-large-v3-turbo` for ~3× faster) |
-| `TYPER_MODE` | `batch` | `batch` — paste once on release; `stream` — diff-paste live |
+| `TYPER_MODEL` | `…/whisper-large-v3-turbo` | Any MLX-hosted Whisper model id (e.g. `…/whisper-large-v3-mlx` for max accuracy at ~2× latency) |
+| `TYPER_MODE` | `release` | `release` — accumulate while held, transcribe once on release, paste (recommended); `live` — re-transcribe & diff-paste as you speak; `both` — stream live, then an authoritative correction pass on release. (`batch`→`release`, `stream`→`live` still accepted) |
 | `TYPER_WHISPER_LANGUAGE` | unset | `en`, `ru`, … — skip auto-detect |
 | `TYPER_INITIAL_PROMPT` | unset | Vocabulary/style prime — best lever for names & jargon |
+| `TYPER_CONDITION_ON_PREV` | `0` | Feed prior output back as conditioning. Off by default — on amplifies repetition loops/hallucinations |
+| `TYPER_STRIP_HALLUCINATIONS` | `1` | Drop a transcription whose ENTIRE text is a stock hallucination phrase ("Thank you", "Thanks for watching", …) |
 | `TYPER_BEST_OF` | `5` | Number of samples to draw at each fallback temperature |
-| `TYPER_TEMPERATURE` | `0.0,0.2,…,1.0` | Whisper fallback temperatures |
+| `TYPER_TEMPERATURE` | `0.0,0.2` | Whisper fallback temperatures (kept short to bound worst-case re-decode latency) |
 | `TYPER_HF_OFFLINE` | `1` when cache exists | Skip HuggingFace API check on startup |
 
 ### Latency
 
 | Var | Default | Notes |
 |---|---|---|
-| `TYPER_PUSH_S` | `0.35` | Minimum interval between transcribe ticks |
+| `TYPER_PUSH_S` | `0.35` | Capture-loop tick interval (re-transcribe cadence in `live`/`both`; just audio-drain in `release`) |
 | `TYPER_MAX_BUFFER_S` | `28.0` | Cap on rolling audio buffer (Whisper context is 30 s) |
 
 ### VAD (voice activity detection)
@@ -104,6 +110,8 @@ touching the source. Most useful knobs:
 | Var | Default | Notes |
 |---|---|---|
 | `TYPER_OVERLAY` | `1` | Set to `0` to disable the HUD entirely |
+| `TYPER_OVERLAY_LEVEL_METER` | `1` | Live mic-activity meter (EQ bars) so you can see the mic is hearing you; `0` hides it |
+| `TYPER_MIC_LEVEL_REF` | `0.12` | RMS mapped to a full meter; lower = more sensitive |
 | `TYPER_OVERLAY_PLACEMENT` | `caret` | `caret`, `cursor`, or `bottom` |
 | `TYPER_OVERLAY_GLASS` | `1` | Set to `0` to force the legacy vibrancy material |
 | `TYPER_OVERLAY_W` | `780` | |
@@ -127,16 +135,35 @@ of knobs and what they do.
 
 ## How it works
 
-Whisper isn't a true streaming model, so we
-approximate it: while you hold Right-⌘, audio is captured into a
-rolling buffer and a Liquid-Glass HUD shows live previews from
-re-transcribing the buffer every tick. On release we either reuse the
-most recent preview (when no significant new audio arrived) or run one
-final whisper pass, then paste the result. Batch-paste avoids the
-diff-flicker and stuck-modifier edge cases of true streaming. Caret
-position for the HUD comes from the macOS Accessibility API
-(`AXBoundsForRange` on the focused text element), with a graceful
-fallback to the mouse cursor when the focused app doesn't expose it.
+While you hold Right-⌘, audio is captured and passed through a Silero
+**voice-activity-detection (VAD) gate** that strips silence so Whisper
+never sees non-speech (the main source of hallucinations). In the default
+`release` mode that's *all* that happens during the hold — no Whisper runs
+until you let go, at which point a single pass transcribes the whole
+silence-trimmed utterance and the text is pasted in one shot. Because no
+per-tick transcription ever ran, there's no in-flight inference to wait out
+on release and no partial-window hallucinations to filter. For dictation
+longer than Whisper's ~30 s context window, the buffer is flushed at VAD
+silence boundaries and each chunk is transcribed exactly once.
+
+`live`/`both` modes additionally re-transcribe the growing buffer every
+tick and diff-paste the new suffix for real-time feedback (`both` then runs
+one authoritative pass on release to correct it). Decoding uses greedy
+`temperature=0` with a short fallback and `condition_on_previous_text=False`
+(the most-cited anti-repetition lever); degenerate segments are dropped via
+Whisper's own `no_speech_prob`/`avg_logprob`/`compression_ratio` metrics.
+
+Text is delivered by copying it to the clipboard and synthesizing Cmd+V.
+That would clobber whatever you had copied, so by default Typer snapshots
+the clipboard when a dictation session starts and restores it once the final
+paste has landed — anything you'd copied before dictating is still there to
+paste afterwards. It only restores if our pasted text is still on the
+clipboard, so it never overwrites something you copied in the meantime.
+Disable with `TYPER_RESTORE_CLIPBOARD=0`.
+
+Caret position for the HUD comes from the macOS Accessibility API
+(`AXBoundsForRange` on the focused text element), with a graceful fallback
+to the mouse cursor when the focused app doesn't expose it.
 
 ---
 
@@ -151,9 +178,10 @@ fallback to the mouse cursor when the focused app doesn't expose it.
 - If F19 triggers macOS Help / a media action instead of reaching the
   app, enable **System Settings → Keyboard → "Use F1, F2, etc. keys as
   standard function keys"** (or remap to a key you don't use, e.g. F13).
-- Tail words you spoke in the last ~0.4 s before release might be cut
-  from the paste in batch mode — adjust `TYPER_PUSH_S` lower if this
-  bites you.
+- In the default `release` mode the whole utterance is transcribed on
+  release, so no tail words are lost. In `live` mode, words spoken in the
+  last ~0.4 s before release can occasionally be cut from the diff — use
+  `release` (or `both`) if that bites you.
 
 ---
 
