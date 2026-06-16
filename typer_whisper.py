@@ -131,9 +131,13 @@ from ApplicationServices import (
     AXUIElementCreateSystemWide,
     AXUIElementCopyAttributeValue,
     AXUIElementCopyParameterizedAttributeValue,
+    AXUIElementCopyElementAtPosition,
+    AXUIElementIsAttributeSettable,
     AXValueGetValue,
     kAXFocusedUIElementAttribute,
     kAXSelectedTextRangeAttribute,
+    kAXRoleAttribute,
+    kAXValueAttribute,
     kAXValueCGRectType,
 )
 
@@ -237,13 +241,25 @@ WHISPER_LOGPROB_THRESHOLD = float(os.environ.get("TYPER_LOGPROB_THRESHOLD", "-1.
 #   threshold → treat segment as silence (emit nothing). Helps with the
 #   classic "Thanks for watching!" hallucination on silence.
 WHISPER_NO_SPEECH_THRESHOLD = float(os.environ.get("TYPER_NO_SPEECH_THRESHOLD", "0.6"))
-# Standalone post-filter: a segment whose no_speech_prob exceeds this is
-# dropped REGARDLESS of confidence. Whisper sometimes confidently captions
-# non-speech (music, typing, a slammed door that passes the energy gate) as
-# fluent text; no_speech_prob is its own "this isn't speech" signal, so a
-# very high value alone is enough to reject. Set well clear of real speech
-# (which sits near 0) to avoid dropping genuine quiet utterances.
+# High-no_speech_prob post-filter. Whisper sometimes captions non-speech
+# (music, typing, a slammed door) as fluent text, and no_speech_prob is its
+# own "this isn't speech" signal. BUT it also reports a high no_speech_prob
+# for REAL speech that sits inside a mostly-silent buffer — e.g. a long
+# trailing pause before the key is released. Dropping on no_speech_prob ALONE
+# therefore erased genuine dictation (observed: a clean, fluent sentence at
+# no_speech_prob=0.91), so we additionally require the segment to be
+# LOW-CONFIDENCE: a confidently-decoded segment (avg_logprob above the bar
+# below) is kept regardless of how silent its surroundings look.
 WHISPER_NO_SPEECH_DROP = float(os.environ.get("TYPER_NO_SPEECH_DROP", "0.9"))
+# Confidence bar for the high-no_speech drop above: a segment is only dropped
+# on no_speech_prob when avg_logprob is also below this. Real fluent speech
+# sits around -0.1…-0.45; stock silence hallucinations sit below ~-0.5, so
+# -0.5 cleanly separates them (this is also the value OpenAI's hallucination
+# thread recommends for logprob thresholds). Set very negative to make the
+# no_speech drop fire on confident segments too (the old behavior).
+WHISPER_NO_SPEECH_DROP_LOGPROB = float(
+    os.environ.get("TYPER_NO_SPEECH_DROP_LOGPROB", "-0.5")
+)
 # Suspected-hallucination silence detection (seconds of word-level
 # silence that flags a segment as hallucinated). Requires word
 # timestamps, whose DTW alignment pass runs on EVERY tick and is a
@@ -266,13 +282,39 @@ WHISPER_CONDITION_ON_PREV = os.environ.get("TYPER_CONDITION_ON_PREV", "0") == "1
 # mangles (e.g. "Tokens used: pynput, MLX, Whisper, Silero.").
 WHISPER_INITIAL_PROMPT = os.environ.get("TYPER_INITIAL_PROMPT", "") or None
 
+# ── POST-TRANSCRIPTION HALLUCINATION FILTER (master switch) ──────────────────
+# Controls the two DOWNSTREAM, text/segment-based hallucination filters that
+# run AFTER Whisper returns:
+#   1. _segment_is_hallucination() — drops a segment by its Whisper confidence
+#      metrics (no_speech_prob / avg_logprob / compression_ratio).
+#   2. the _HALLUCINATION_PHRASES stock-phrase blocklist below.
+#
+# Why it's OFF by default: both filters were discarding LEGITIMATE short
+# utterances. A one- or two-word command ("yes", "no", "okay", "you", "bye")
+# gives Whisper almost no context, so it routinely comes back with a high
+# no_speech_prob and/or a low avg_logprob — indistinguishable, by these
+# metrics, from a silence hallucination — and the per-segment filter dropped
+# it. Worse, the phrase blocklist contained bare words like "you"/"bye", so
+# saying exactly those erased the dictation outright.
+#
+# The RELIABLE defense against silence/noise hallucinations is UPSTREAM and
+# audio-based, and it stays on regardless of this switch:
+#   • the Silero VAD gate strips silence before Whisper sees it,
+#   • the MIN_SPEECH_RMS energy gate skips near-silent buffers entirely
+#     (so a silent release never reaches Whisper at all), and
+#   • Whisper's own no_speech_threshold (passed into transcribe) suppresses
+#     non-speech segments internally.
+# With those in place the downstream text filter is redundant and costs us
+# real short words, so we disable it. Set TYPER_HALLUCINATION_FILTER=1 to
+# restore the old aggressive post-filtering (e.g. for very noisy mics).
+HALLUCINATION_FILTER = os.environ.get("TYPER_HALLUCINATION_FILTER", "0") == "1"
+
 # Belt-and-suspenders stripper for the classic Whisper-on-silence
-# hallucinations. With VAD + condition_on_previous_text=False these should
-# be near-dead code, but several dictation tools ship this and it's cheap
-# insurance: if Whisper's ENTIRE output for a buffer is one of these stock
-# phrases (the YouTube-caption boilerplate Whisper emits on silence/noise),
-# drop it. We only reject when the WHOLE transcription matches a phrase, so a
-# legitimate sentence that merely ends in "thank you" is never touched.
+# hallucinations. Only consulted when HALLUCINATION_FILTER is enabled. If
+# Whisper's ENTIRE output for a buffer is one of these stock phrases (the
+# YouTube-caption boilerplate Whisper emits on silence/noise), drop it. We
+# only reject when the WHOLE transcription matches a phrase, so a legitimate
+# sentence that merely ends in "thank you" is never touched.
 TYPER_STRIP_HALLUCINATIONS = os.environ.get("TYPER_STRIP_HALLUCINATIONS", "1") == "1"
 
 def _normalize_phrase(s):
@@ -287,8 +329,15 @@ _HALLUCINATION_PHRASES = {
         "Thank you for watching", "Thank you for watching!",
         "Please subscribe", "Please subscribe!",
         "Subtitles by the Amara.org community",
-        "Bye", "Bye.", "Bye-bye", "you", ".",
+        "Bye-bye", ".",
     )
+    # NOTE: bare "you" and "Bye"/"Bye." are deliberately NOT here — they are
+    # legitimate one-word answers and were the worst false-positive offenders
+    # (AGH "Bag of Hallucinations" finds short-word blocklists drive most
+    # false drops). The multi-word "Thank you …"/"Thanks for watching"/etc.
+    # phrases stay because they only realistically appear as Whisper silence
+    # boilerplate. Even so this list only runs when TYPER_HALLUCINATION_FILTER
+    # is enabled; the upstream VAD + MIN_SPEECH_RMS gate is the real defense.
 }
 
 # Hard cap on the rolling buffer fed to Whisper each tick. Whisper's
@@ -543,9 +592,15 @@ def _segment_is_hallucination(seg):
     nsp = seg.get("no_speech_prob")
     alp = seg.get("avg_logprob")
     cr = seg.get("compression_ratio")
-    # Non-speech: a very high no_speech_prob on its own is enough.
-    if nsp is not None and nsp > WHISPER_NO_SPEECH_DROP:
-        return True, "no_speech_prob=%.2f (standalone)" % nsp
+    # Non-speech: very high no_speech_prob, but ONLY when the segment is also
+    # low-confidence. A confident, fluent segment with a high no_speech_prob
+    # is almost always real speech inside a mostly-silent buffer (long pause
+    # before release), not a non-speech caption — dropping it on no_speech
+    # alone was erasing real dictation. avg_logprob unknown ⇒ treat as
+    # low-confidence (be conservative) so the drop still applies.
+    if (nsp is not None and nsp > WHISPER_NO_SPEECH_DROP
+            and (alp is None or alp < WHISPER_NO_SPEECH_DROP_LOGPROB)):
+        return True, "no_speech_prob=%.2f avg_logprob=%s" % (nsp, alp)
     # Silence: high no-speech probability AND low confidence. Both conditions
     # so we don't drop a confidently-transcribed quiet word.
     if (nsp is not None and alp is not None
@@ -597,11 +652,18 @@ def _whisper_transcribe(audio_f32, initial_prompt=None):
     def _finalize(text):
         """Apply the whole-output stock-hallucination filter."""
         text = (text or "").strip()
-        if (TYPER_STRIP_HALLUCINATIONS and text
+        if (HALLUCINATION_FILTER and TYPER_STRIP_HALLUCINATIONS and text
                 and _normalize_phrase(text) in _HALLUCINATION_PHRASES):
             log.warning("dropping whole-output hallucination phrase: %r", text)
             return ""
         return text
+
+    # When the post-transcription filter is OFF (default), trust the upstream
+    # VAD + MIN_SPEECH_RMS gate and Whisper's own no_speech_threshold; don't
+    # second-guess with the per-segment/phrase filters that erase legitimate
+    # short utterances ("yes", "no", "you", "bye"). Return Whisper's text as-is.
+    if not HALLUCINATION_FILTER:
+        return (res.get("text") or "").strip()
 
     segs = res.get("segments")
     if not segs:
@@ -1027,6 +1089,112 @@ def _caret_screen_rect():
     except Exception:
         log.debug("caret lookup failed", exc_info=True)
         return None
+
+
+# Accessibility roles used to classify a click target as a place you can type.
+# Editable text inputs across native/web toolkits report one of these roles…
+_AX_EDITABLE_ROLES = {
+    "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField",
+}
+# …and these are unambiguously NON-text controls — clicking one should never
+# start dictation. (We block on these even in permissive mode.)
+_AX_NON_EDITABLE_ROLES = {
+    "AXButton", "AXMenuButton", "AXPopUpButton", "AXMenuItem", "AXMenuBarItem",
+    "AXLink", "AXStaticText", "AXImage", "AXCheckBox", "AXRadioButton",
+    "AXSlider", "AXIncrementor", "AXStepper", "AXDisclosureTriangle",
+    "AXColorWell", "AXScrollBar", "AXTabGroup", "AXToolbar",
+    "AXSegmentedControl", "AXRadioGroup", "AXDockItem",
+}
+
+
+def _ax_role(el):
+    try:
+        err, role = AXUIElementCopyAttributeValue(el, kAXRoleAttribute, None)
+        if err or role is None:
+            return None
+        return str(role)
+    except Exception:
+        return None
+
+
+def _ax_element_editability(el):
+    """Classify an AX element as 'editable', 'non_editable', or 'unknown'.
+
+    'editable' = a place keystrokes can land: a text-input role, OR it exposes
+    a selected-text range (every real text input does — the same signal the
+    caret overlay uses), OR its AXValue is settable. 'non_editable' = a known
+    non-text control. Anything else (generic containers, web groups, no AX
+    data) is 'unknown' so the caller can decide how cautious to be."""
+    if el is None:
+        return "unknown"
+    role = _ax_role(el)
+    if role in _AX_EDITABLE_ROLES:
+        return "editable"
+    # A live selected-text range means it's a text input regardless of role
+    # (covers contenteditable web areas that report generic roles).
+    try:
+        err, rng = AXUIElementCopyAttributeValue(
+            el, kAXSelectedTextRangeAttribute, None)
+        if not err and rng is not None:
+            return "editable"
+    except Exception:
+        pass
+    # A settable AXValue is an editable control (read-only labels aren't).
+    try:
+        err, settable = AXUIElementIsAttributeSettable(el, kAXValueAttribute, None)
+        if not err and settable:
+            return "editable"
+    except Exception:
+        pass
+    if role in _AX_NON_EDITABLE_ROLES:
+        return "non_editable"
+    return "unknown"
+
+
+def _click_should_start_dictation(x, y):
+    """Editability gate for the mouse trigger. Returns True if we should start
+    dictation for a left-click long-press at screen point (x, y).
+
+    Strategy: classify the element directly UNDER the click first (that's what
+    the user pointed at — a button vs a field). If that's inconclusive, fall
+    back to the currently FOCUSED element (where typing would actually land).
+    Block only when something is POSITIVELY non-editable; when AX can't tell
+    (apps that don't expose accessibility — Electron, some web fields, GPU
+    terminals), start anyway so the trigger keeps working there.
+
+    pynput delivers (x, y) in the global top-left screen space, which is
+    exactly what AXUIElementCopyElementAtPosition expects — no flip needed."""
+    # 1) What did they click ON?
+    pt_state = "unknown"
+    try:
+        err, el = AXUIElementCopyElementAtPosition(
+            _ax_system, float(x), float(y), None)
+        if not err and el is not None:
+            pt_state = _ax_element_editability(el)
+    except Exception:
+        log.debug("AX point lookup failed", exc_info=True)
+    if pt_state == "editable":
+        return True
+    if pt_state == "non_editable":
+        log.debug("mouse trigger gated: click target non-editable")
+        return False
+    # 2) Point inconclusive → where would typing go (focused element)?
+    foc_state = "unknown"
+    try:
+        err, foc = AXUIElementCopyAttributeValue(
+            _ax_system, kAXFocusedUIElementAttribute, None)
+        if not err and foc is not None:
+            foc_state = _ax_element_editability(foc)
+    except Exception:
+        log.debug("AX focus lookup failed", exc_info=True)
+    if foc_state == "editable":
+        return True
+    if foc_state == "non_editable":
+        log.debug("mouse trigger gated: focused element non-editable")
+        return False
+    # 3) Both inconclusive → start anyway (permissive).
+    log.debug("mouse trigger: editability unknown — starting (permissive)")
+    return True
 
 
 class _LevelMeterView(NSView):
@@ -1968,10 +2136,18 @@ def _do_live_stream():
                     max(0, new_samples) / SAMPLE_RATE,
                     len(voiced_buf) / SAMPLE_RATE, infer_ms,
                 )
-            if text is None:
-                overlay_hide()
-                return
-            if text != last_pasted:
+            # SAFETY NET: never let an empty authoritative pass erase text the
+            # user already watched stream into the field. An empty result here
+            # is almost always a degenerate final re-decode of a silence-padded
+            # buffer (or an over-aggressive hallucination filter), NOT "you said
+            # nothing" — so keep what's on screen instead of backspacing it all.
+            if (text is None or not text.strip()) and (last_pasted or "").strip():
+                log.warning(
+                    "commit-final: authoritative pass produced no text — keeping "
+                    "%d already-streamed chars instead of erasing them",
+                    len(last_pasted),
+                )
+            elif text is not None and text != last_pasted:
                 last_pasted = _emit_diff(text, last_pasted)
         overlay_hide()
         # Single-line summary of where the post-release time went, so any
@@ -2204,8 +2380,11 @@ _mouse_click_state = {
 
 def _mouse_hold_timer_fire():
     """Runs MOUSE_HOLD_MS after a left-down event. Fires the start
-    callback only if the button is still down and the cursor hasn't
-    drifted past the movement threshold."""
+    callback only if the button is still down, the cursor hasn't drifted
+    past the movement threshold, AND the click landed on / focuses an
+    editable text field. Firing at the END of the hold (not at mouse-down)
+    is deliberate: focus has settled by now, which is when the AX
+    editability check is reliable."""
     with _mouse_click_lock:
         if not _mouse_click_state["down"]:
             return  # released before threshold
@@ -2213,6 +2392,21 @@ def _mouse_hold_timer_fire():
             return  # turned into a drag, don't hijack it
         if _mouse_click_state["fired_start"]:
             return  # defensive — shouldn't happen
+        x0 = _mouse_click_state["x0"]
+        y0 = _mouse_click_state["y0"]
+    # Editability gate runs OUTSIDE the lock — it does Accessibility IPC that
+    # can take a few ms, and we must not block the mouse listener thread.
+    if not _click_should_start_dictation(x0, y0):
+        log.debug("mouse left-click long-press: target not editable — not starting")
+        return
+    with _mouse_click_lock:
+        # Re-validate after the AX lookup: the button may have been released
+        # or dragged while we were querying. Only commit if still a clean
+        # pending hold, and only THEN mark fired_start so the release handler
+        # knows a session is live (and a gated no-start can't trigger a stop).
+        if (not _mouse_click_state["down"] or _mouse_click_state["moved"]
+                or _mouse_click_state["fired_start"]):
+            return
         _mouse_click_state["fired_start"] = True
     log.debug("mouse left-click long-press → hold-to-talk start")
     start_live_dictation()
@@ -2339,6 +2533,22 @@ def main():
         return _h
     signal.signal(signal.SIGINT,  _force_exit("SIGINT"))
     signal.signal(signal.SIGTERM, _force_exit("SIGTERM"))
+
+    # pynput's keyboard and mouse listeners EACH call
+    # HIServices.AXIsProcessTrusted() from their own thread the instant they
+    # start. PyObjC resolves that lazy framework attribute with a DESTRUCTIVE
+    # funcmap.pop() that isn't thread-safe: if both listener threads hit the
+    # first access concurrently, the loser raises `KeyError:
+    # 'AXIsProcessTrusted'` and its listener thread dies on startup — so on a
+    # given launch either the hotkeys or the mouse trigger silently wouldn't
+    # work. Touch it ONCE here on the main thread first; that populates
+    # PyObjC's attribute cache (HIServices.__dict__) so the listener threads
+    # hit the cached function and never enter the racy resolver.
+    try:
+        import HIServices
+        HIServices.AXIsProcessTrusted()
+    except Exception:
+        log.debug("AXIsProcessTrusted pre-resolve failed", exc_info=True)
 
     # The keyboard.Listener spawns its own Quartz event-tap thread, so we
     # can start it and leave the main thread free to run AppKit's run

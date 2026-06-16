@@ -84,7 +84,8 @@ touching the source. Most useful knobs:
 | `TYPER_WHISPER_LANGUAGE` | unset | `en`, `ru`, … — skip auto-detect |
 | `TYPER_INITIAL_PROMPT` | unset | Vocabulary/style prime — best lever for names & jargon |
 | `TYPER_CONDITION_ON_PREV` | `0` | Feed prior output back as conditioning. Off by default — on amplifies repetition loops/hallucinations |
-| `TYPER_STRIP_HALLUCINATIONS` | `1` | Drop a transcription whose ENTIRE text is a stock hallucination phrase ("Thank you", "Thanks for watching", …) |
+| `TYPER_HALLUCINATION_FILTER` | `0` | Master switch for the DOWNSTREAM text/segment hallucination filters (per-segment confidence drop + stock-phrase blocklist). **Off by default** — these were discarding legitimate short utterances ("yes", "no", "you", "bye"). Silence is still suppressed upstream by VAD + `TYPER_MIN_SPEECH_RMS` and Whisper's own `no_speech_threshold`. Set `1` to restore aggressive post-filtering for very noisy mics |
+| `TYPER_STRIP_HALLUCINATIONS` | `1` | Drop a transcription whose ENTIRE text is a stock hallucination phrase ("Thank you", "Thanks for watching", …). Only consulted when `TYPER_HALLUCINATION_FILTER=1` |
 | `TYPER_BEST_OF` | `5` | Number of samples to draw at each fallback temperature |
 | `TYPER_TEMPERATURE` | `0.0,0.2` | Whisper fallback temperatures (kept short to bound worst-case re-decode latency) |
 | `TYPER_HF_OFFLINE` | `1` when cache exists | Skip HuggingFace API check on startup |
@@ -104,6 +105,22 @@ touching the source. Most useful knobs:
 | `TYPER_VAD_PRE_ROLL_MS` | `500` | Audio retained before speech onset |
 | `TYPER_VAD_HANGOVER_MS` | `400` | Silence required to mark end of utterance |
 | `TYPER_VAD_RMS_FLOOR` | `0.005` | Minimum RMS energy before VAD even runs |
+
+### Mouse trigger (optional alternative to the hotkeys)
+
+Left-click-and-hold to start dictation, release to stop. Off by default.
+
+| Var | Default | Notes |
+|---|---|---|
+| `TYPER_MOUSE_CLICK_TRIGGER` | `0` | `1` enables left-click long-press as a trigger |
+| `TYPER_MOUSE_HOLD_MS` | `700` | How long the click must be held before dictation starts |
+| `TYPER_MOUSE_MOVE_PX` | `5` | Pointer drift that cancels the trigger (keeps click-drag working) |
+
+The mouse trigger only starts dictation when the click lands on / focuses an
+editable text field (via the Accessibility API), so clicking buttons, links,
+or empty areas won't start it. It's permissive — in apps that don't expose
+accessibility (Electron, some web fields, GPU terminals) it still starts,
+since it can't positively rule out a text field.
 
 ### Overlay HUD
 
