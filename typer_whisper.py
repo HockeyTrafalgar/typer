@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Typer — Hold-to-Talk Live Typing (Whisper-MLX, Apple Silicon native)
+Typer — Hold-to-Talk Dictation (Whisper-MLX, Apple Silicon native)
 
-Hold Right-⌘ → speak → words stream into the focused field in near real time;
-release to stop (Right-⌘ or F18). Or tap F19 to toggle dictation on/off.
+Hold Right-⌘ → speak → release; the whole utterance is transcribed once and
+pasted into the focused field. Or tap F19 to toggle dictation on/off.
+
+Voice pipeline mirrors Handy (the most popular open-source local dictation
+app): hold the key → accumulate ONLY Silero-VAD voiced audio (threshold 0.3
+with onset/hangover smoothing) → on release transcribe the whole utterance
+ONCE with a plain greedy decode (no prior-text context, Whisper's own
+no-speech gate) → strip filler words and stutters → paste in one shot. No
+live/streaming mode, no energy gate, and no confidence/phrase hallucination
+post-filter — the VAD is the defense, exactly as in Handy.
 
 Model: mlx-community/whisper-large-v3-turbo via mlx-whisper — multilingual
        (~99 languages) with automatic language detection, native Apple
-       Silicon. Whisper is NOT a streaming model, so the default "release"
-       mode is true push-to-talk: accumulate VAD-gated audio while held,
-       transcribe the whole utterance ONCE on release, paste it in one shot.
-       This is the architecture popular local Whisper dictation tools use
-       (Handy, WhisperWriter) and it avoids the silence hallucinations and
-       post-release latency that re-transcribing a growing buffer causes.
-       Optional "live" mode re-transcribes every push interval and diff-pastes
-       the suffix as you speak; "both" streams live then runs an authoritative
-       correction pass on release. Set via TYPER_MODE.
+       Silicon. Override with TYPER_MODEL.
 
 Requirements: mlx-whisper, pynput, pyperclip, sounddevice, numpy,
               silero-vad, onnxruntime, torch
@@ -157,221 +157,37 @@ NSWindowStyleMaskNonactivatingPanel = 1 << 7
 MODEL_ID = os.environ.get("TYPER_MODEL", "mlx-community/whisper-large-v3-turbo")
 SAMPLE_RATE = 16000
 
-# Dictation mode — how/when transcribed text reaches the focused field:
-#   "release" — TRUE push-to-talk batch (default, recommended). While the
-#               key is held we ONLY accumulate VAD-gated audio; Whisper does
-#               not run. On release we transcribe the whole utterance ONCE
-#               and paste it in one shot. No per-tick re-transcription means
-#               no silence/boundary hallucinations and no in-flight tick to
-#               wait out on release — the two problems the old pseudo-stream
-#               had. This is the architecture every popular local Whisper
-#               dictation tool (Handy, WhisperWriter hold-to-record) uses.
-#   "live"    — words stream into the field AS YOU SPEAK: every push interval
-#               we re-transcribe the buffer and diff-paste the new suffix.
-#               Most responsive, but uses partial-window decoding (more
-#               hallucination surface) and no separate final correction.
-#   "both"    — stream live for responsiveness AND run one authoritative
-#               Whisper pass on release that reconciles/corrects whatever was
-#               streamed (backspace the streamed tail, paste the final text).
-#               Best feel on a fast model (turbo).
-# Back-compat: the old "batch" maps to "release", old "stream" to "live".
-TYPER_MODE = os.environ.get("TYPER_MODE", "release").lower()
-_TYPER_MODE_ALIASES = {"batch": "release", "stream": "live"}
-TYPER_MODE = _TYPER_MODE_ALIASES.get(TYPER_MODE, TYPER_MODE)
-if TYPER_MODE not in ("release", "live", "both"):
-    TYPER_MODE = "release"
-# Derived flags used throughout the capture loop:
-#   _MODE_PREVIEWS — run Whisper per tick during capture (live/both)
-#   _MODE_STREAMS  — diff-paste into the field during capture (live/both)
-# In "release" both are False: capture just accumulates audio.
-_MODE_PREVIEWS = TYPER_MODE in ("live", "both")
-_MODE_STREAMS = TYPER_MODE in ("live", "both")
+# ── SPEECH PIPELINE (Handy-style) ────────────────────────────────────────────
+# We mirror Handy's voice pipeline: hold the key -> accumulate ONLY Silero-VAD
+# voiced audio -> transcribe the whole utterance ONCE on release -> strip
+# fillers/stutters -> paste. There is deliberately no live/streaming mode, no
+# energy gate, and no confidence/phrase hallucination post-filter: Handy gets
+# its reliability from the VAD plus a plain greedy decode, and so do we. The
+# handful of values below are the only speech settings; everything else is
+# hardcoded to Handy's choices (see _whisper_transcribe and the VAD config).
 
-# How often the capture loop ticks. In live/both this is how often we
-# re-transcribe and diff-paste; in release it's just the audio-drain /
-# long-dictation flush cadence (no Whisper). Whisper is not natively streaming,
-# so each tick re-runs the model on the full voiced audio captured so
-# far. Larger = lower CPU/GPU load, more lag in the overlay preview.
-#
-# Note: this is the MINIMUM wait between ticks; if inference takes
-# longer than the interval (very likely with whisper-large-v3 once the
-# buffer grows past ~5 s), the real cadence is bounded by inference time.
-# If you want truly snappy feedback, switch to a faster model:
-#   TYPER_MODEL=mlx-community/whisper-large-v3-turbo  # ~3× faster
-#   TYPER_MODEL=mlx-community/whisper-small-mlx       # ~10× faster
-LIVE_PUSH_INTERVAL_S = float(os.environ.get("TYPER_PUSH_S", "0.35"))
-
-# Optional explicit language code (e.g. "en", "ru"). Empty = auto-detect
-# per inference call. Setting this skips detection and saves a bit of time.
+# Optional explicit language (e.g. "en", "ru"). Empty = Whisper auto-detects.
 WHISPER_LANGUAGE = os.environ.get("TYPER_WHISPER_LANGUAGE", "") or None
 
-# Decoding knobs forwarded to mlx_whisper.transcribe(). mlx-whisper does
-# NOT yet implement beam search (raises NotImplementedError), so we use
-# greedy decode at T=0 with temperature-fallback sampling at higher T when
-# the output looks degenerate. Set TYPER_BEAM_SIZE > 1 only if a future
-# mlx-whisper release adds beam decoding.
-WHISPER_BEAM_SIZE   = int(os.environ.get("TYPER_BEAM_SIZE", "1"))
-WHISPER_BEST_OF     = int(os.environ.get("TYPER_BEST_OF", "5"))
-# Comma-separated fallback temperatures. Whisper starts at the first;
-# if the result fails the compression_ratio / logprob thresholds below,
-# it retries at the next higher temperature (where best_of kicks in).
-# Single value (e.g. "0.0") = pure greedy, no fallback (faster, more
-# fragile to hallucinations).
-#
-# IMPORTANT latency note: each fallback step is a FULL re-decode. When the
-# model gets stuck in a repetition loop ("page page page…") the looping
-# output trips compression_ratio_threshold and retries at EVERY remaining
-# temperature — each generating ~448 garbage tokens — which turned a 0.64 s
-# buffer into a 10.8 s finalize in the wild. We cap the default at three
-# steps so the worst case is bounded (~3 decodes, not 6). The real defense
-# against hallucinations is upstream: the speech-energy gate (MIN_SPEECH_RMS)
-# keeps silence from being decoded at all, and degenerate segments that do
-# slip through are dropped by their Whisper confidence metrics (see
-# _segment_is_hallucination). Set more steps for max robustness on noisy
-# audio, or "0.0" for the snappiest (greedy-only) decode.
-WHISPER_TEMPERATURE = os.environ.get("TYPER_TEMPERATURE", "0.0,0.2")
-# Fallback triggers — Whisper's defaults, exposed for tuning.
-# compression_ratio_threshold: gzip(text)/len(text) above this → likely
-#   stuck in a repetition loop → retry at higher T. Lower = stricter.
-WHISPER_COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("TYPER_COMPRESSION_RATIO", "2.4"))
-# logprob_threshold: avg token log-prob below this → low-confidence
-#   output → retry at higher T. Less negative = stricter.
-WHISPER_LOGPROB_THRESHOLD = float(os.environ.get("TYPER_LOGPROB_THRESHOLD", "-1.0"))
-# no_speech_threshold: <|nospeech|> prob above this AND logprob below
-#   threshold → treat segment as silence (emit nothing). Helps with the
-#   classic "Thanks for watching!" hallucination on silence.
-WHISPER_NO_SPEECH_THRESHOLD = float(os.environ.get("TYPER_NO_SPEECH_THRESHOLD", "0.6"))
-# High-no_speech_prob post-filter. Whisper sometimes captions non-speech
-# (music, typing, a slammed door) as fluent text, and no_speech_prob is its
-# own "this isn't speech" signal. BUT it also reports a high no_speech_prob
-# for REAL speech that sits inside a mostly-silent buffer — e.g. a long
-# trailing pause before the key is released. Dropping on no_speech_prob ALONE
-# therefore erased genuine dictation (observed: a clean, fluent sentence at
-# no_speech_prob=0.91), so we additionally require the segment to be
-# LOW-CONFIDENCE: a confidently-decoded segment (avg_logprob above the bar
-# below) is kept regardless of how silent its surroundings look.
-WHISPER_NO_SPEECH_DROP = float(os.environ.get("TYPER_NO_SPEECH_DROP", "0.9"))
-# Confidence bar for the high-no_speech drop above: a segment is only dropped
-# on no_speech_prob when avg_logprob is also below this. Real fluent speech
-# sits around -0.1…-0.45; stock silence hallucinations sit below ~-0.5, so
-# -0.5 cleanly separates them (this is also the value OpenAI's hallucination
-# thread recommends for logprob thresholds). Set very negative to make the
-# no_speech drop fire on confident segments too (the old behavior).
-WHISPER_NO_SPEECH_DROP_LOGPROB = float(
-    os.environ.get("TYPER_NO_SPEECH_DROP_LOGPROB", "-0.5")
-)
-# Suspected-hallucination silence detection (seconds of word-level
-# silence that flags a segment as hallucinated). Requires word
-# timestamps, whose DTW alignment pass runs on EVERY tick and is a
-# meaningful chunk of per-tick latency. Disabled by default ("") because
-# the VAD gate already strips silence before Whisper sees it and
-# no_speech_threshold catches the rest, making this largely redundant
-# here. Set to e.g. "2.0" to re-enable if hallucinations slip through.
-WHISPER_HALLUCINATION_SILENCE_S = os.environ.get("TYPER_HALLUCINATION_SILENCE_S", "")
-# Whether the model sees its own prior output as conditioning. ON gives
-# better long-form coherence (consistent spelling/style across the buffer)
-# but is the single most-cited cause of Whisper repetition loops and
-# hallucination cascades — once it emits garbage, that garbage conditions
-# the next window and snowballs. whisper.cpp's streaming example disables it
-# by default ("no_context"); so do we. Default OFF. The chunked-commit path
-# still feeds the committed transcript's tail as an explicit initial_prompt
-# for cross-chunk coherence, which gives the upside without the feedback loop.
-WHISPER_CONDITION_ON_PREV = os.environ.get("TYPER_CONDITION_ON_PREV", "0") == "1"
-# Optional vocabulary/style prime fed to every transcription call. Use
-# this to bias toward names, jargon, or formatting Whisper otherwise
-# mangles (e.g. "Tokens used: pynput, MLX, Whisper, Silero.").
-WHISPER_INITIAL_PROMPT = os.environ.get("TYPER_INITIAL_PROMPT", "") or None
+# Optional vocabulary prime fed to Whisper as initial_prompt to bias toward
+# names/jargon -- exactly how Handy passes its "custom words".
+CUSTOM_WORDS = os.environ.get("TYPER_INITIAL_PROMPT", "").strip() or None
 
-# ── POST-TRANSCRIPTION HALLUCINATION FILTER (master switch) ──────────────────
-# Controls the two DOWNSTREAM, text/segment-based hallucination filters that
-# run AFTER Whisper returns:
-#   1. _segment_is_hallucination() — drops a segment by its Whisper confidence
-#      metrics (no_speech_prob / avg_logprob / compression_ratio).
-#   2. the _HALLUCINATION_PHRASES stock-phrase blocklist below.
-#
-# Why it's OFF by default: both filters were discarding LEGITIMATE short
-# utterances. A one- or two-word command ("yes", "no", "okay", "you", "bye")
-# gives Whisper almost no context, so it routinely comes back with a high
-# no_speech_prob and/or a low avg_logprob — indistinguishable, by these
-# metrics, from a silence hallucination — and the per-segment filter dropped
-# it. Worse, the phrase blocklist contained bare words like "you"/"bye", so
-# saying exactly those erased the dictation outright.
-#
-# The RELIABLE defense against silence/noise hallucinations is UPSTREAM and
-# audio-based, and it stays on regardless of this switch:
-#   • the Silero VAD gate strips silence before Whisper sees it,
-#   • the MIN_SPEECH_RMS energy gate skips near-silent buffers entirely
-#     (so a silent release never reaches Whisper at all), and
-#   • Whisper's own no_speech_threshold (passed into transcribe) suppresses
-#     non-speech segments internally.
-# With those in place the downstream text filter is redundant and costs us
-# real short words, so we disable it. Set TYPER_HALLUCINATION_FILTER=1 to
-# restore the old aggressive post-filtering (e.g. for very noisy mics).
-HALLUCINATION_FILTER = os.environ.get("TYPER_HALLUCINATION_FILTER", "0") == "1"
+# Whisper's own no-speech probability gate. Handy/transcribe-rs uses 0.2;
+# segments Whisper itself flags as non-speech above this are dropped inside
+# mlx_whisper.transcribe. This is the ONLY hallucination guard we keep, and it
+# is Whisper's built-in one -- no custom post-filtering on top.
+NO_SPEECH_THRESHOLD = 0.2
 
-# Belt-and-suspenders stripper for the classic Whisper-on-silence
-# hallucinations. Only consulted when HALLUCINATION_FILTER is enabled. If
-# Whisper's ENTIRE output for a buffer is one of these stock phrases (the
-# YouTube-caption boilerplate Whisper emits on silence/noise), drop it. We
-# only reject when the WHOLE transcription matches a phrase, so a legitimate
-# sentence that merely ends in "thank you" is never touched.
-TYPER_STRIP_HALLUCINATIONS = os.environ.get("TYPER_STRIP_HALLUCINATIONS", "1") == "1"
+# How often the capture loop drains the mic queue while the key is held
+# (seconds). Pure audio plumbing -- no transcription runs until release.
+CAPTURE_TICK_S = 0.1
 
-def _normalize_phrase(s):
-    """Lowercase, drop punctuation, collapse whitespace — for matching a
-    transcription against the stock-hallucination phrase set."""
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", s)).strip().lower()
-
-_HALLUCINATION_PHRASES = {
-    _normalize_phrase(p) for p in (
-        "Thank you", "Thank you.", "Thank you very much",
-        "Thanks for watching", "Thanks for watching!",
-        "Thank you for watching", "Thank you for watching!",
-        "Please subscribe", "Please subscribe!",
-        "Subtitles by the Amara.org community",
-        "Bye-bye", ".",
-    )
-    # NOTE: bare "you" and "Bye"/"Bye." are deliberately NOT here — they are
-    # legitimate one-word answers and were the worst false-positive offenders
-    # (AGH "Bag of Hallucinations" finds short-word blocklists drive most
-    # false drops). The multi-word "Thank you …"/"Thanks for watching"/etc.
-    # phrases stay because they only realistically appear as Whisper silence
-    # boilerplate. Even so this list only runs when TYPER_HALLUCINATION_FILTER
-    # is enabled; the upstream VAD + MIN_SPEECH_RMS gate is the real defense.
-}
-
-# Hard cap on the rolling buffer fed to Whisper each tick. Whisper's
-# context is 30 s; beyond that the model windows internally and gets
-# slower per call. We cap a bit under that to keep latency bounded.
-MAX_BUFFER_S = float(os.environ.get("TYPER_MAX_BUFFER_S", "28.0"))
-
-# Chunked commit. Whisper can't see audio older than the rolling buffer, so
-# for dictation longer than the cap we'd otherwise lose the beginning. Once
-# the live buffer grows past COMMIT_AT_SILENCE_S *and* VAD reports we're in a
-# silence gap (a clean segment boundary), we transcribe the buffer, append
-# the text to a committed transcript, and clear the buffer. The buffer never
-# exceeds MAX_BUFFER_S; the final paste is committed_text + the live tail, so
-# arbitrarily long dictation survives in full. Keep this comfortably under
-# MAX_BUFFER_S so there's room to wait for a silence boundary before the hard
-# cap forces a (possibly mid-word) flush.
-#
-# This also bounds per-tick latency: every tick re-transcribes the WHOLE live
-# buffer, so a smaller buffer = faster ticks = the live preview keeps pace with
-# speech instead of falling progressively behind on long dictation. 8 s is low
-# enough to keep ticks snappy while still giving Whisper a few sentences of
-# context per chunk.
-COMMIT_AT_SILENCE_S = float(os.environ.get("TYPER_COMMIT_AT_SILENCE_S", "8.0"))
-# How much of the committed transcript's tail to feed back as Whisper's
-# initial_prompt when transcribing the live buffer, for cross-flush coherence.
-COMMIT_CONTEXT_CHARS = int(os.environ.get("TYPER_COMMIT_CONTEXT_CHARS", "200"))
-
-# Minimum voiced-audio duration before we run a PREVIEW transcribe.
-# Whisper happily hallucinates plausible text on tiny chunks ("Thank
-# you.", "Bye."), so until we have ≥ this many seconds of voiced
-# audio the HUD just stays on "Dictating…" without committing to a
-# guess. The final commit-on-release path uses its own much lower
-# threshold so short legitimate utterances ("yes", "no") still paste.
-MIN_PREVIEW_AUDIO_S = float(os.environ.get("TYPER_MIN_PREVIEW_S", "1.0"))
+# Short-clip zero-pad (Handy audio.rs): pad an utterance with under 1.0 s of
+# voiced audio up to 1.25 s so Whisper's encoder stays stable on one-word
+# answers like "yes"/"no".
+PAD_BELOW_SAMPLES = SAMPLE_RATE            # under 1.0 s of audio
+PAD_TO_SAMPLES    = SAMPLE_RATE * 5 // 4   # -> 1.25 s
 
 # Clipboard handling for the Cmd+V paste.
 #
@@ -412,31 +228,18 @@ def _release_modifiers():
             pass
 
 # ── VAD CONFIG ──────────────────────────────────────────────────────────────
-VAD_FRAME = 512
-# Lower threshold = triggers earlier on soft phoneme attacks (s/f/th,
-# unvoiced consonants) at the cost of more false positives. Silero's
-# author-recommended default is 0.5; we use it here to avoid clipping
-# word onsets.
-VAD_THRESHOLD = float(os.environ.get("TYPER_VAD_THRESHOLD", "0.5"))
-# Lead-in flushed at speech onset. Must cover the gap between actual
-# phoneme onset and Silero crossing the threshold (typically 100-300 ms
-# for soft attacks). 500 ms is generous; reduce if you see leading
-# breath/click noise in the transcript.
-VAD_PRE_ROLL_MS = int(os.environ.get("TYPER_VAD_PRE_ROLL_MS", "500"))
-VAD_HANGOVER_MS = int(os.environ.get("TYPER_VAD_HANGOVER_MS", "400"))
-# Minimum RMS energy required to even run the VAD on a frame. Too high
-# and quiet speech onsets get gated out before Silero ever sees them.
-# 0.005 keeps room ambience out but admits soft speech.
-VAD_RMS_FLOOR = float(os.environ.get("TYPER_VAD_RMS_FLOOR", "0.005"))
-# Whole-buffer speech-energy gate applied right BEFORE we run Whisper.
-# Silero occasionally false-positives on noise-floor audio (observed:
-# p=1.00 at rms≈0.005), and Whisper then hallucinates fluent text on that
-# near-silence. Real speech buffers sit at rms≈0.02–0.07, false positives
-# at ≈0.005–0.006, so a gate at 0.01 cleanly separates them with margin on
-# both sides. Skipping these buffers prevents the hallucination at the
-# source AND avoids the wasted (often multi-second) inference on silence.
-# Set to 0 to disable.
-MIN_SPEECH_RMS = float(os.environ.get("TYPER_MIN_SPEECH_RMS", "0.01"))
+VAD_FRAME = 512  # samples per Silero frame @ 16 kHz (~32 ms)
+# Speech-probability threshold. Handy uses 0.3 (below Silero's 0.5 default) to
+# catch soft consonant onsets; the onset debounce below rejects the noise
+# blips that a low threshold would otherwise let in.
+VAD_THRESHOLD = 0.3
+# Pre-roll flushed at speech onset, and trailing silence kept after speech
+# ends. Handy uses ~450 ms for each (15 frames at its 30 ms frame size).
+VAD_PRE_ROLL_MS = 450
+VAD_HANGOVER_MS = 450
+# Onset debounce: require this many CONSECUTIVE voiced frames before opening
+# the gate, so a single noise blip can't start a capture (Handy onset = 2).
+VAD_ONSET_FRAMES = 2
 
 # ── OVERLAY CONFIG ──────────────────────────────────────────────────────────
 # Floating HUD that previews the live transcript next to the mouse
@@ -563,120 +366,99 @@ latched          = False
 inference_q = queue.Queue()
 
 # ── INFERENCE THREAD ─────────────────────────────────────────────────────────
-def _parse_temperature(spec):
-    parts = [p.strip() for p in spec.split(",") if p.strip()]
-    vals = tuple(float(p) for p in parts)
-    return vals[0] if len(vals) == 1 else vals
-
-_WHISPER_TEMPERATURE_PARSED = _parse_temperature(WHISPER_TEMPERATURE)
-_WHISPER_HALLUCINATION_SILENCE_PARSED = (
-    float(WHISPER_HALLUCINATION_SILENCE_S) if WHISPER_HALLUCINATION_SILENCE_S else None
-)
-
-def _segment_is_hallucination(seg):
-    """Decide whether a Whisper segment is a hallucination, using the model's
-    OWN per-segment quality metrics rather than inspecting the text:
-
-      • no_speech_prob — Whisper's probability the audio is non-speech. High
-        value = it transcribed silence/noise (the "Thank you." on silence
-        and "For lower limit…" on near-silence both score high here).
-      • avg_logprob    — mean token log-probability. Genuine hallucinations
-        on silence are low-confidence.
-      • compression_ratio — len(text)/len(gzip(text)). A repetition loop
-        ("x x x …") is extremely compressible, so this spikes well above the
-        ~1.5–2.2 of normal prose. This is the same signal Whisper uses
-        internally to trigger temperature fallback; if it's STILL high after
-        fallback, the output is degenerate and should be dropped, not pasted.
-
-    Returns (is_hallucination, reason)."""
-    nsp = seg.get("no_speech_prob")
-    alp = seg.get("avg_logprob")
-    cr = seg.get("compression_ratio")
-    # Non-speech: very high no_speech_prob, but ONLY when the segment is also
-    # low-confidence. A confident, fluent segment with a high no_speech_prob
-    # is almost always real speech inside a mostly-silent buffer (long pause
-    # before release), not a non-speech caption — dropping it on no_speech
-    # alone was erasing real dictation. avg_logprob unknown ⇒ treat as
-    # low-confidence (be conservative) so the drop still applies.
-    if (nsp is not None and nsp > WHISPER_NO_SPEECH_DROP
-            and (alp is None or alp < WHISPER_NO_SPEECH_DROP_LOGPROB)):
-        return True, "no_speech_prob=%.2f avg_logprob=%s" % (nsp, alp)
-    # Silence: high no-speech probability AND low confidence. Both conditions
-    # so we don't drop a confidently-transcribed quiet word.
-    if (nsp is not None and alp is not None
-            and nsp > WHISPER_NO_SPEECH_THRESHOLD
-            and alp < WHISPER_LOGPROB_THRESHOLD):
-        return True, "no_speech_prob=%.2f avg_logprob=%.2f" % (nsp, alp)
-    # Degenerate / repetition loop.
-    if cr is not None and cr > WHISPER_COMPRESSION_RATIO_THRESHOLD:
-        return True, "compression_ratio=%.2f" % cr
-    return False, ""
 
 
-def _whisper_transcribe(audio_f32, initial_prompt=None):
-    """Run mlx_whisper.transcribe on a float32 mono 16 kHz array, return text.
+# ── TEXT CLEANUP (ported from Handy's text.rs) ───────────────────────────────
+# Language-aware filler lists. "um"/"eh"/"ha" are real words in some languages
+# (Portuguese "um" = a/an, Spanish "ha" = has), so they're only treated as
+# fillers where they genuinely are; unknown languages get a list that omits
+# those.
+_FILLER_WORDS = {
+    "en": ["uh", "um", "uhm", "umm", "uhh", "uhhh", "ah", "hmm", "hm", "mmm",
+           "mm", "mh", "eh", "ehh", "ha"],
+    "es": ["ehm", "mmm", "hmm", "hm"],
+    "pt": ["ahm", "hmm", "mmm", "hm"],
+    "fr": ["euh", "hmm", "hm", "mmm"],
+    "de": ["äh", "ähm", "hmm", "hm", "mmm"],
+    "it": ["ehm", "hmm", "mmm", "hm"],
+    "cs": ["ehm", "hmm", "mmm", "hm"],
+    "pl": ["hmm", "mmm", "hm"],
+    "tr": ["hmm", "mmm", "hm"],
+    "ru": ["хм", "ммм", "hmm", "mmm"],
+    "uk": ["хм", "ммм", "hmm", "mmm"],
+    "ar": ["hmm", "mmm"],
+    "ja": ["hmm", "mmm"],
+    "ko": ["hmm", "mmm"],
+    "vi": ["hmm", "mmm", "hm"],
+    "zh": ["hmm", "mmm"],
+}
+_FILLER_FALLBACK = ["uh", "uhm", "umm", "uhh", "uhhh", "ah", "hmm", "hm",
+                    "mmm", "mm", "mh", "ehh"]
 
-    `initial_prompt`, when given, overrides the global TYPER_INITIAL_PROMPT
-    for this call. Used by the chunked-commit path to feed the tail of the
-    already-committed transcript as context, so spelling/style stays
-    consistent across a buffer flush."""
+
+def _filler_words_for_language(lang):
+    base = (lang or "en").split("-")[0].split("_")[0]
+    return _FILLER_WORDS.get(base, _FILLER_FALLBACK)
+
+
+def _collapse_stutters(text):
+    """Collapse 3+ consecutive identical (case-insensitive) alphabetic words to
+    one: "wh wh wh wh" -> "wh", "I I I I" -> "I". Two repeats are left alone."""
+    words = text.split()
+    if not words:
+        return text
+    result = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word.lower().isalpha():
+            count = 1
+            while i + count < len(words) and words[i + count].lower() == word.lower():
+                count += 1
+            result.append(word)
+            i += count if count >= 3 else 1
+        else:
+            result.append(word)
+            i += 1
+    return " ".join(result)
+
+
+def _filter_transcription_output(text, lang):
+    """Handy's filter_transcription_output: remove filler words, collapse
+    stutters, normalize whitespace. The ONLY post-processing we do."""
+    filtered = text
+    for word in _filler_words_for_language(lang):
+        filtered = re.sub(r"(?i)\b%s\b[,.]?" % re.escape(word), "", filtered)
+    filtered = _collapse_stutters(filtered)
+    filtered = re.sub(r"\s{2,}", " ", filtered)
+    return filtered.strip()
+
+
+def _whisper_transcribe(audio_f32):
+    """Transcribe a float32 mono 16 kHz array the way Handy does: a single
+    plain decode (no temperature ladder, no prior-text context, Whisper's own
+    no-speech gate), then filler/stutter cleanup. No energy gate and no
+    confidence/phrase hallucination post-filter -- the Silero VAD upstream is
+    the real defense against silence captions."""
     kwargs = dict(
         path_or_hf_repo=MODEL_ID,
-        temperature=_WHISPER_TEMPERATURE_PARSED,
-        compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
-        logprob_threshold=WHISPER_LOGPROB_THRESHOLD,
-        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-        condition_on_previous_text=WHISPER_CONDITION_ON_PREV,
+        temperature=0.0,
+        condition_on_previous_text=False,
+        no_speech_threshold=NO_SPEECH_THRESHOLD,
         fp16=True,
         verbose=None,
     )
     if WHISPER_LANGUAGE:
         kwargs["language"] = WHISPER_LANGUAGE
-    prompt = initial_prompt if initial_prompt is not None else WHISPER_INITIAL_PROMPT
-    if prompt:
-        kwargs["initial_prompt"] = prompt
-    if _WHISPER_HALLUCINATION_SILENCE_PARSED is not None:
-        kwargs["hallucination_silence_threshold"] = _WHISPER_HALLUCINATION_SILENCE_PARSED
-        kwargs["word_timestamps"] = True  # required for silence detection
-    # mlx_whisper exposes decoder knobs via DecodingOptions kwargs surfaced
-    # through transcribe(); beam_size triggers beam search when > 1.
-    if WHISPER_BEAM_SIZE > 1:
-        kwargs["beam_size"] = WHISPER_BEAM_SIZE
-    else:
-        kwargs["best_of"] = WHISPER_BEST_OF
+    if CUSTOM_WORDS:
+        kwargs["initial_prompt"] = CUSTOM_WORDS
     res = mlx_whisper.transcribe(audio_f32, **kwargs)
-    # Filter out hallucinated segments using Whisper's own confidence metrics
-    # (no_speech_prob / avg_logprob / compression_ratio) instead of pattern-
-    # matching the text. Keeps the good segments, drops silence/degenerate
-    # ones. Falls back to the raw text if the build doesn't return segments.
-    def _finalize(text):
-        """Apply the whole-output stock-hallucination filter."""
-        text = (text or "").strip()
-        if (HALLUCINATION_FILTER and TYPER_STRIP_HALLUCINATIONS and text
-                and _normalize_phrase(text) in _HALLUCINATION_PHRASES):
-            log.warning("dropping whole-output hallucination phrase: %r", text)
-            return ""
-        return text
-
-    # When the post-transcription filter is OFF (default), trust the upstream
-    # VAD + MIN_SPEECH_RMS gate and Whisper's own no_speech_threshold; don't
-    # second-guess with the per-segment/phrase filters that erase legitimate
-    # short utterances ("yes", "no", "you", "bye"). Return Whisper's text as-is.
-    if not HALLUCINATION_FILTER:
-        return (res.get("text") or "").strip()
-
-    segs = res.get("segments")
-    if not segs:
-        return _finalize(res.get("text"))
-    kept = []
-    for seg in segs:
-        bad, reason = _segment_is_hallucination(seg)
-        if bad:
-            log.warning("dropping hallucinated segment (%s): %r",
-                        reason, (seg.get("text") or "").strip()[:90])
-            continue
-        kept.append(seg.get("text") or "")
-    return _finalize("".join(kept))
+    text = (res.get("text") or "").strip()
+    lang = WHISPER_LANGUAGE or res.get("language") or "en"
+    cleaned = _filter_transcription_output(text, lang)
+    if cleaned != text:
+        log.debug("cleanup: %r -> %r", text, cleaned)
+    return cleaned
 
 def inference_worker():
     """Owns MLX state. Warms the model, then services live jobs forever."""
@@ -717,39 +499,40 @@ def inference_worker():
 
 # ── VAD GATE ─────────────────────────────────────────────────────────────────
 class VadGate:
-    """Streaming Silero-VAD gate. Returns only voiced audio with pre-roll
-    lead-in and post-speech hangover, so we don't feed silence to Whisper
-    (which loves to hallucinate on silence)."""
-    def __init__(self, model, threshold, pre_roll_ms, hangover_ms, rms_floor):
+    """Streaming Silero-VAD gate with onset debounce, pre-roll and hangover --
+    a port of Handy's SmoothedVad. Emits only voiced audio (plus a pre-roll
+    lead-in and a short hangover tail), so Whisper never sees silence."""
+
+    def __init__(self, model, threshold, pre_roll_ms, hangover_ms, onset_frames):
         self.model = model
         self.threshold = threshold
-        self.pre_roll_frames = max(1, pre_roll_ms * 16000 // 1000 // VAD_FRAME)
-        self.hangover_frames = max(1, hangover_ms * 16000 // 1000 // VAD_FRAME)
-        self.rms_floor = rms_floor
+        self.prefill_frames = max(1, pre_roll_ms * SAMPLE_RATE // 1000 // VAD_FRAME)
+        self.hangover_frames = max(1, hangover_ms * SAMPLE_RATE // 1000 // VAD_FRAME)
+        self.onset_frames = max(1, onset_frames)
         self.tail = np.zeros(0, dtype=np.float32)
-        self.pre_roll = collections.deque(maxlen=self.pre_roll_frames)
+        # Most-recent frames, flushed as pre-roll at speech onset.
+        self.frame_buffer = collections.deque(maxlen=self.prefill_frames + 1)
         self.in_speech = False
-        self.silent_run = 0
+        self.hangover_counter = 0
+        self.onset_counter = 0
         self.stats = {"frames": 0, "voiced": 0, "emitted": 0,
                       "speech_starts": 0, "speech_ends": 0}
 
     def reset(self):
         self.tail = np.zeros(0, dtype=np.float32)
-        self.pre_roll.clear()
+        self.frame_buffer.clear()
         self.in_speech = False
-        self.silent_run = 0
+        self.hangover_counter = 0
+        self.onset_counter = 0
         try:
             self.model.reset_states()
         except Exception:
             pass
 
     def _is_voiced(self, frame):
-        rms = float(np.sqrt(np.mean(frame * frame)))
-        if rms < self.rms_floor:
-            return False, 0.0, rms
         with torch.no_grad():
             prob = float(self.model(torch.from_numpy(frame), 16000).item())
-        return prob >= self.threshold, prob, rms
+        return prob >= self.threshold, prob
 
     def process(self, samples):
         if len(samples) == 0:
@@ -759,33 +542,38 @@ class VadGate:
         out = []
         for i in range(n):
             frame = buf[i * VAD_FRAME:(i + 1) * VAD_FRAME].astype(np.float32, copy=False)
-            voiced, prob, rms = self._is_voiced(frame)
+            # Buffer every frame for possible pre-roll (Handy frame_buffer).
+            self.frame_buffer.append(frame)
+            voiced, prob = self._is_voiced(frame)
             self.stats["frames"] += 1
             if voiced:
                 self.stats["voiced"] += 1
-            if voiced:
-                if not self.in_speech:
+            if not self.in_speech and voiced:
+                # Potential onset: need onset_frames consecutive voiced frames.
+                self.onset_counter += 1
+                if self.onset_counter >= self.onset_frames:
                     self.in_speech = True
+                    self.hangover_counter = self.hangover_frames
+                    self.onset_counter = 0
                     self.stats["speech_starts"] += 1
-                    log.debug("VAD ▶ speech start (p=%.2f rms=%.4f, flushing %d pre-roll frames)",
-                              prob, rms, len(self.pre_roll))
-                    for pr in self.pre_roll:
-                        out.append(pr)
-                    self.pre_roll.clear()
-                self.silent_run = 0
+                    log.debug("VAD start (p=%.2f, flushing %d pre-roll frames)",
+                              prob, len(self.frame_buffer))
+                    out.extend(self.frame_buffer)
+                    self.frame_buffer.clear()
+            elif self.in_speech and voiced:
+                self.hangover_counter = self.hangover_frames
                 out.append(frame)
-            else:
-                if self.in_speech:
+            elif self.in_speech and not voiced:
+                if self.hangover_counter > 0:
+                    self.hangover_counter -= 1
                     out.append(frame)
-                    self.silent_run += 1
-                    if self.silent_run >= self.hangover_frames:
-                        self.in_speech = False
-                        self.silent_run = 0
-                        self.stats["speech_ends"] += 1
-                        log.debug("VAD ■ speech end (hangover %d frames)",
-                                  self.hangover_frames)
                 else:
-                    self.pre_roll.append(frame)
+                    self.in_speech = False
+                    self.stats["speech_ends"] += 1
+                    log.debug("VAD end (hangover elapsed)")
+            else:
+                # Silence or broken onset run.
+                self.onset_counter = 0
         self.tail = buf[n * VAD_FRAME:].copy()
         if out:
             arr = np.concatenate(out)
@@ -1772,47 +1560,17 @@ def _paste_text(text):
         _kbd.press('v')
         _kbd.release('v')
 
-def _emit_diff(current, last):
-    """Backspace over the diverged tail of `last`, paste the new tail of
-    `current`. Returns the canonical text now in the field.
-
-    WARNING (live/both only): this assumes the focused field still holds
-    exactly `last`. It backspaces `len(last) - common_prefix` characters
-    blindly, so if the user types into the field between ticks — or moves
-    the caret — those keystrokes will be eaten by the next diff. The default
-    "release" mode avoids this entirely by pasting once on release."""
-    n = min(len(current), len(last))
-    i = 0
-    while i < n and current[i] == last[i]:
-        i += 1
-    to_delete = len(last) - i
-    to_add = current[i:]
-    if to_delete or to_add:
-        log.debug("diff: -%d +%d (common=%d)", to_delete, len(to_add), i)
-    if to_delete > 0:
-        _release_modifiers()
-        for _ in range(to_delete):
-            _kbd.press(keyboard.Key.backspace)
-            _kbd.release(keyboard.Key.backspace)
-    if to_add:
-        _paste_text(to_add)
-    return current
-
 def _do_live_stream():
-    """Capture + transcribe for one dictation session. Runs ON THE
-    INFERENCE THREAD (MLX owner).
+    """Capture + transcribe for one dictation session (Handy-style). Runs ON
+    THE INFERENCE THREAD (MLX owner).
 
-    Captures VAD-gated voiced audio into a rolling buffer. Behavior depends
-    on TYPER_MODE:
-      release — accumulate only; transcribe ONCE on release and paste.
-      live    — every LIVE_PUSH_INTERVAL_S re-run Whisper on the buffer and
-                diff-paste the new suffix into the focused field.
-      both    — stream like live, then run one authoritative pass on release
-                and reconcile the streamed text against it.
+    While the key is held we accumulate ONLY Silero-VAD voiced audio; no
+    transcription happens during capture. On release we transcribe the whole
+    utterance ONCE, clean fillers/stutters, and paste it in one shot.
 
-    Audio comes from the PERSISTENT InputStream opened once at app
-    startup (see _open_persistent_audio_input). Falls back to opening
-    a per-session stream only if the persistent one failed to come up.
+    Audio comes from the PERSISTENT InputStream opened once at app startup
+    (see _open_persistent_audio_input). Falls back to opening a per-session
+    stream only if the persistent one failed to come up.
     """
     log.info("live stream begin")
     # Health check the persistent stream BEFORE recording. If CoreAudio
@@ -1854,322 +1612,80 @@ def _do_live_stream():
     gate = None
     try:
         gate = VadGate(_get_vad_model(), VAD_THRESHOLD,
-                       VAD_PRE_ROLL_MS, VAD_HANGOVER_MS, VAD_RMS_FLOOR)
-        log.info("VAD active (threshold=%.2f pre_roll=%dms hangover=%dms rms_floor=%.4f)",
-                 VAD_THRESHOLD, VAD_PRE_ROLL_MS, VAD_HANGOVER_MS, VAD_RMS_FLOOR)
+                       VAD_PRE_ROLL_MS, VAD_HANGOVER_MS, VAD_ONSET_FRAMES)
+        log.info("VAD active (threshold=%.2f pre_roll=%dms hangover=%dms onset=%d)",
+                 VAD_THRESHOLD, VAD_PRE_ROLL_MS, VAD_HANGOVER_MS, VAD_ONSET_FRAMES)
     except Exception:
-        log.exception("VAD init failed, falling back to raw audio (hallucinations possible)")
+        log.exception("VAD init failed -- feeding raw audio (Handy relies on VAD)")
 
-    last_pasted = ""       # live/both diff state; in release, the final paste
-    last_preview = ""      # whisper text for the CURRENT live buffer only
-    committed_text = ""    # transcript of segments already flushed out of buf
     iters = 0
-    max_buf_samples = int(MAX_BUFFER_S * SAMPLE_RATE)
-    commit_buf_samples = int(COMMIT_AT_SILENCE_S * SAMPLE_RATE)
     voiced_buf = np.zeros(0, dtype=np.float32)
-
-    def _join(a, b):
-        """Concatenate two transcript fragments with exactly one space."""
-        a, b = a.rstrip(), b.strip()
-        if a and b:
-            return a + " " + b
-        return a or b
-
-    def _commit_context():
-        """Tail of the committed transcript, fed to Whisper as initial_prompt
-        so the live buffer's transcription stays coherent across a flush.
-        Returns None when there's nothing committed yet (use global prompt)."""
-        if not committed_text:
-            return None
-        return committed_text[-COMMIT_CONTEXT_CHARS:]
+    state = {"transitioned": False}
 
     def _ingest_audio():
-        """Drain the audio queue into voiced_buf (with VAD gating).
-        Returns True if any new voiced audio was added this call."""
+        """Drain the mic queue, VAD-gate it, and append voiced audio to the
+        buffer. No transcription here -- we just accumulate while held."""
         nonlocal voiced_buf
-        buf = []
+        chunks = []
         while True:
             try:
-                buf.append(audio_q.get_nowait())
+                chunks.append(audio_q.get_nowait())
             except queue.Empty:
                 break
-        if not buf:
-            return False
-        samples = np.concatenate(buf)
-        raw_n = len(samples)
+        if not chunks:
+            return
+        samples = np.concatenate(chunks)
         if gate is not None:
             samples = gate.process(samples)
-        if not len(samples):
-            return False
-        log.debug("drain: raw=%d voiced=%d (%.2fs voiced)",
-                  raw_n, len(samples), len(samples) / SAMPLE_RATE)
-        voiced_buf = np.concatenate([voiced_buf, samples])
-        # "release" mode bounds the buffer via the chunked-commit path
-        # (_maybe_commit), which transcribes and flushes a completed segment
-        # out at a silence boundary WITHOUT discarding audio Whisper never
-        # saw. The streaming modes (live/both) diff-paste each tick and have
-        # no committed-text accumulator, so they keep the old lossy cap-drop
-        # to bound the buffer.
-        if _MODE_STREAMS and len(voiced_buf) > max_buf_samples:
-            drop = len(voiced_buf) - max_buf_samples
-            log.debug("buffer cap hit, dropping %d oldest samples", drop)
-            voiced_buf = voiced_buf[drop:]
-        return True
+        if len(samples):
+            voiced_buf = np.concatenate([voiced_buf, samples])
+            if not state["transitioned"]:
+                state["transitioned"] = True
+                overlay_set_state("dictating")
 
-    def _transcribe_buffer(min_audio_s=0.25):
-        """Run Whisper on the current voiced_buf. Returns the text, or
-        None if the buffer is shorter than `min_audio_s`, is below the
-        speech-energy floor (silence / VAD false positive — Whisper
-        hallucinates on it), or inference failed."""
-        if len(voiced_buf) < int(min_audio_s * SAMPLE_RATE):
-            return None
-        # Energy gate: skip near-silent buffers that slipped past the VAD.
-        # Prevents silence-hallucinations AND the wasted inference on them.
-        if MIN_SPEECH_RMS > 0 and len(voiced_buf):
-            rms = float(np.sqrt(np.mean(voiced_buf * voiced_buf)))
-            if rms < MIN_SPEECH_RMS:
-                log.debug("skip transcribe: buffer rms=%.4f < %.4f "
-                          "(near-silence / VAD false positive)",
-                          rms, MIN_SPEECH_RMS)
-                return None
-        t_infer = time.time()
-        try:
-            text = _whisper_transcribe(voiced_buf, initial_prompt=_commit_context())
-        except Exception:
-            log.exception("whisper transcribe failed this tick")
-            return None
-        infer_ms = (time.time() - t_infer) * 1000.0
-        log.debug("whisper tick: buf=%.2fs infer=%.0fms text=%r",
-                  len(voiced_buf) / SAMPLE_RATE, infer_ms, text)
-        return text
-
-    # Tracked so _commit_final can decide whether to rerun whisper. If the
-    # most recent preview already saw all the SPEECH we captured, paste that
-    # cached text instead of paying ~1 s for another whisper pass on release.
-    #   preview_buf_samples — voiced_buf length at last successful preview
-    #   preview_voiced      — gate voiced-frame count at last successful preview
-    state = {
-        "transitioned": False,
-        "preview_buf_samples": 0,
-        "preview_voiced": 0,
-    }
-    # Sample-count fallback (used when VAD is unavailable): reuse the preview
-    # if < 0.4 s of new audio arrived since it ran.
-    REUSE_PREVIEW_THRESHOLD_SAMPLES = int(0.4 * SAMPLE_RATE)
-    # Speech-aware reuse (preferred, VAD present): the real cost on release is
-    # a redundant final whisper pass that re-transcribes audio whose only
-    # change since the last preview is VAD hangover / trailing silence. If
-    # fewer than this many NEW *voiced* frames arrived since the last preview,
-    # the preview already has all your words, so reuse it and paste instantly.
-    # ~0.2 s of speech (one VAD frame = 512 samples = 32 ms @ 16 kHz).
-    REUSE_VOICED_THRESHOLD_FRAMES = int(0.2 * SAMPLE_RATE / VAD_FRAME)
-
-    def _maybe_commit():
-        """release mode only. For dictation that outgrows Whisper's ~30 s
-        context, flush the live buffer once it has grown past
-        COMMIT_AT_SILENCE_S and VAD says we're in a silence gap (a clean
-        segment boundary): transcribe the chunk ONCE here, append it to
-        committed_text, and clear the buffer. A hard cap at MAX_BUFFER_S
-        force-flushes even mid-speech so the buffer (and Whisper latency)
-        never runs away during a long pause-free utterance; that rare case
-        may cut a word, which is unavoidable given Whisper's context window.
-        After a flush the buffer is empty and the next chunk transcribes
-        fresh, conditioned on the committed tail via _commit_context().
-
-        Unlike the old pseudo-streaming path this transcribes each chunk
-        EXACTLY ONCE (at its boundary), never re-decoding a growing buffer —
-        so short utterances (the common case) never invoke Whisper until
-        release, and long ones invoke it only once per ~8 s segment."""
-        nonlocal committed_text, voiced_buf
-        n = len(voiced_buf)
-        at_silence = (gate is None) or (not gate.in_speech)
-        over_soft = n >= commit_buf_samples and at_silence
-        over_hard = n >= max_buf_samples
-        if not (over_soft or over_hard):
-            return
-        text = _transcribe_buffer()
-        if text and text.strip():
-            committed_text = _join(committed_text, text)
-            log.debug("commit flush: +%d chars (buf=%.2fs, %s); committed=%d chars",
-                      len(text), n / SAMPLE_RATE,
-                      "silence" if over_soft else "hard-cap", len(committed_text))
-        else:
-            # Nothing worth committing (e.g. buffer is all hangover silence).
-            # Only clear if we're slamming the hard cap, to avoid runaway.
-            if not over_hard:
-                return
-        voiced_buf = np.zeros(0, dtype=np.float32)
-
-    def _tick_preview():
-        """Per-interval tick during recording.
-
-        In "release" mode this does NO transcription — it only drains audio
-        into the buffer and (for very long dictation) flushes a chunk at a
-        silence boundary. Whisper runs once on release. This is what kills
-        both the silence hallucinations and the post-release latency.
-
-        In "live"/"both" it additionally runs a Whisper preview on the
-        growing buffer and diff-pastes the new suffix into the focused
-        field for live feedback."""
-        nonlocal last_preview, last_pasted
+    def _finalize():
+        """Run once after release: drain the last audio, transcribe the whole
+        utterance ONCE, clean it, and paste it."""
+        nonlocal voiced_buf
         _ingest_audio()
-        # Flip the placeholder Listening… → Dictating… on the first tick
-        # where VAD has emitted any voiced audio. Signals to the user
-        # that we've heard them even before whisper produces words.
-        if not state["transitioned"] and len(voiced_buf) > 0:
-            state["transitioned"] = True
-            overlay_set_state("dictating")
-        if not _MODE_PREVIEWS:
-            # release mode: accumulate only. Flush a chunk to committed_text
-            # if the buffer has grown past the soft/hard cap (long dictation).
-            _maybe_commit()
-            return
-        # Hold off on running whisper until we have at least
-        # MIN_PREVIEW_AUDIO_S of voiced audio. Whisper produces
-        # plausible-but-wrong text on shorter chunks ("Thank you.",
-        # "Bye.", "Subtitles by …") and showing that in the HUD just
-        # confuses the user. Final commit-on-release uses its own much
-        # lower threshold so short legitimate utterances still paste.
-        text = _transcribe_buffer(min_audio_s=MIN_PREVIEW_AUDIO_S)
-        if text is None:
-            return
-        state["preview_buf_samples"] = len(voiced_buf)
-        state["preview_voiced"] = gate.stats["voiced"] if gate else 0
-        # live/both: diff-paste the new suffix into the focused field.
-        if text != last_pasted:
-            last_pasted = _emit_diff(text, last_pasted)
-        # Mirror the running transcript in the overlay too.
-        if text != last_preview:
-            last_preview = text
-            overlay_set_text(text)
-
-    def _commit_final():
-        """Called after the user releases.
-
-        release : transcribe the whole utterance ONCE and paste it. There
-                  was no preview tick, so there's nothing to wait out and
-                  nothing to reuse — release→text is a single uninterrupted
-                  pass on a short, silence-trimmed buffer.
-        live    : the field already holds the streamed text; transcribe the
-                  final buffer (reusing the last preview when no new speech
-                  arrived) and diff-paste any correction.
-        both    : ALWAYS run one authoritative pass and reconcile it against
-                  whatever was streamed — that final correction is the whole
-                  reason to use this mode, so we never reuse the preview."""
-        nonlocal last_preview, last_pasted
-        # ── release→finalize latency breakdown ──────────────────────────
-        # t_enter is when _commit_final actually starts running; the gap
-        # between the user's release and t_enter is the time we spent
-        # waiting out an in-flight whisper tick (the loop only checks the
-        # stop event between ticks, and MLX inference can't be interrupted).
-        # In "release" mode no tick ever runs Whisper, so this is ~0.
-        t_enter = time.time()
-        handoff_ms = ((t_enter - live_stop_requested_at) * 1000.0
-                      if live_stop_requested_at else -1.0)
-        log.debug("commit-final: enter (release→enter handoff=%.0fms — "
-                  "in-flight tick wait)", handoff_ms)
-        # If the user hit Esc, drop everything: no transcribe, no paste,
-        # no overlay revisions — just hide the HUD and bail.
         if live_cancel_event.is_set():
-            log.info("commit-final: cancelled, skipping paste")
+            log.info("finalize: cancelled, skipping paste")
+            overlay_hide()
+            return
+        audio = voiced_buf
+        # Short-clip zero-pad (Handy): keep Whisper stable on one-word answers.
+        if 0 < len(audio) < PAD_BELOW_SAMPLES:
+            audio = np.concatenate(
+                [audio, np.zeros(PAD_TO_SAMPLES - len(audio), dtype=np.float32)])
+        if not len(audio):
+            log.info("finalize: no voiced audio captured")
             overlay_hide()
             return
         t0 = time.time()
-        _ingest_audio()
-        ingest_ms = (time.time() - t0) * 1000.0
-        paste_ms = 0.0
-        reuse = False
-
-        if TYPER_MODE == "release":
-            # Pure batch: one Whisper pass on the full buffer, paste once.
-            t0 = time.time()
-            text = _transcribe_buffer()
-            infer_ms = (time.time() - t0) * 1000.0
-            log.info("commit-final: release pass (buf=%.2fs, %.0fms infer)",
-                     len(voiced_buf) / SAMPLE_RATE, infer_ms)
-            # Paste the ENTIRE transcript in one shot — the segments already
-            # flushed into committed_text PLUS this final buffer tail. (text
-            # may be None/empty if the user released right after a flush left
-            # the buffer empty; committed_text still carries the rest.)
-            full = _join(committed_text, text or "")
-            if not full:
-                overlay_hide()
-                return
-            # Append a trailing space so two back-to-back dictations don't
-            # stick together ("hello there" + "how are you").
-            payload = full + " "
-            overlay_set_text(full)
-            t0 = time.time()
-            _paste_text(payload)
-            paste_ms = (time.time() - t0) * 1000.0
-            last_pasted = payload
-        else:
-            # live / both: the field already holds streamed text. Decide
-            # whether to re-transcribe. "both" always does (authoritative
-            # correction); "live" reuses the preview when no new speech came.
-            new_samples = len(voiced_buf) - state["preview_buf_samples"]
-            if gate is not None:
-                new_voiced = gate.stats["voiced"] - state["preview_voiced"]
-                reuse = (last_preview
-                         and new_voiced <= REUSE_VOICED_THRESHOLD_FRAMES)
-                reuse_reason = ("%d new voiced frames <= %d"
-                                % (new_voiced, REUSE_VOICED_THRESHOLD_FRAMES))
-            else:
-                reuse = (last_preview
-                         and new_samples < REUSE_PREVIEW_THRESHOLD_SAMPLES)
-                reuse_reason = ("%.2fs new audio < %.2fs"
-                                % (new_samples / SAMPLE_RATE,
-                                   REUSE_PREVIEW_THRESHOLD_SAMPLES / SAMPLE_RATE))
-            t0 = time.time()
-            if TYPER_MODE == "live" and reuse:
-                text = last_preview
-                infer_ms = 0.0
-                log.info("commit-final: reusing preview, no extra inference (%s)",
-                         reuse_reason)
-            else:
-                text = _transcribe_buffer()
-                infer_ms = (time.time() - t0) * 1000.0
-                log.info(
-                    "commit-final: %s pass (%.2fs new audio, buf=%.2fs, "
-                    "%.0fms infer)",
-                    "authoritative" if TYPER_MODE == "both" else "re-ran whisper",
-                    max(0, new_samples) / SAMPLE_RATE,
-                    len(voiced_buf) / SAMPLE_RATE, infer_ms,
-                )
-            # SAFETY NET: never let an empty authoritative pass erase text the
-            # user already watched stream into the field. An empty result here
-            # is almost always a degenerate final re-decode of a silence-padded
-            # buffer (or an over-aggressive hallucination filter), NOT "you said
-            # nothing" — so keep what's on screen instead of backspacing it all.
-            if (text is None or not text.strip()) and (last_pasted or "").strip():
-                log.warning(
-                    "commit-final: authoritative pass produced no text — keeping "
-                    "%d already-streamed chars instead of erasing them",
-                    len(last_pasted),
-                )
-            elif text is not None and text != last_pasted:
-                last_pasted = _emit_diff(text, last_pasted)
-        overlay_hide()
-        # Single-line summary of where the post-release time went, so any
-        # future delay regression is attributable to a specific step.
+        try:
+            text = _whisper_transcribe(audio)
+        except Exception:
+            log.exception("whisper transcribe failed")
+            overlay_hide()
+            return
+        infer_ms = (time.time() - t0) * 1000.0
         total_ms = ((time.time() - live_stop_requested_at) * 1000.0
-                    if live_stop_requested_at else (time.time() - t_enter) * 1000.0)
-        log.info(
-            "commit-final timing: total(release→pasted)=%.0fms = "
-            "handoff/in-flight=%.0fms + ingest=%.0fms + infer=%.0fms + "
-            "paste=%.0fms | reused=%s chars=%d",
-            total_ms, max(0.0, handoff_ms), ingest_ms, infer_ms, paste_ms,
-            reuse, len(last_pasted or ""),
-        )
+                    if live_stop_requested_at else infer_ms)
+        log.info("finalize: buf=%.2fs infer=%.0fms total(release->pasted)=%.0fms text=%r",
+                 len(voiced_buf) / SAMPLE_RATE, infer_ms, total_ms, text)
+        if not text:
+            overlay_hide()
+            return
+        # Trailing space so consecutive dictations don't run together.
+        overlay_set_text(text)
+        _paste_text(text + " ")
+        overlay_hide()
 
     t_start = time.time()
     try:
-        log.info("stream cfg: mode=%s model=%s push=%.2fs beam=%d temp=%s "
-                 "best_of=%d cond_prev=%s lang=%s halluc_silence=%s prompt=%r",
-                 TYPER_MODE, MODEL_ID, LIVE_PUSH_INTERVAL_S, WHISPER_BEAM_SIZE,
-                 WHISPER_TEMPERATURE, WHISPER_BEST_OF,
-                 WHISPER_CONDITION_ON_PREV, WHISPER_LANGUAGE or "auto",
-                 _WHISPER_HALLUCINATION_SILENCE_PARSED, WHISPER_INITIAL_PROMPT)
+        log.info("stream cfg: model=%s lang=%s no_speech=%.2f prompt=%r",
+                 MODEL_ID, WHISPER_LANGUAGE or "auto", NO_SPEECH_THRESHOLD,
+                 CUSTOM_WORDS)
         overlay_show("Listening…")
         # Snapshot the user's clipboard now, before any paste overwrites it,
         # so we can restore it after this session's final paste.
@@ -2196,24 +1712,14 @@ def _do_live_stream():
             else:
                 log.debug("audio input enabled (persistent stream)")
             while not live_stop_event.is_set():
-                # wait() returns immediately when the user releases, instead
-                # of finishing the full LIVE_PUSH_INTERVAL_S sleep — keeps
-                # the final whisper pass close to the release event.
-                if live_stop_event.wait(LIVE_PUSH_INTERVAL_S):
+                # wait() returns immediately on release, so the final pass runs
+                # right after the key comes up.
+                if live_stop_event.wait(CAPTURE_TICK_S):
                     break
                 iters += 1
-                t_tick = time.time()
-                _tick_preview()
-                tick_ms = (time.time() - t_tick) * 1000.0
-                try:
-                    active_mb = mx.get_active_memory() / (1024 * 1024)
-                    peak_mb = mx.get_peak_memory() / (1024 * 1024)
-                    log.debug("tick %d: preview=%.0fms mlx_active=%.0fMB peak=%.0fMB",
-                              iters, tick_ms, active_mb, peak_mb)
-                except Exception:
-                    log.debug("tick %d: preview=%.0fms", iters, tick_ms)
-            log.debug("commit-final after %d iters", iters)
-            _commit_final()
+                _ingest_audio()
+            log.debug("finalize after %d iters", iters)
+            _finalize()
         finally:
             # Stop the callback from collecting more samples; the
             # persistent stream itself stays OPEN for the next session.
@@ -2236,9 +1742,9 @@ def _do_live_stream():
         if gate:
             gate.reset()
         log.info(
-            "live stream end: dur=%.2fs iters=%d audio_calls=%d audio_frames=%d status_warns=%d vad=%s final_text=%r",
+            "live stream end: dur=%.2fs iters=%d audio_calls=%d audio_frames=%d status_warns=%d vad=%s",
             time.time() - t_start, iters, cb_stats["calls"], cb_stats["frames"],
-            cb_stats["status_warns"], vad_stats, last_pasted,
+            cb_stats["status_warns"], vad_stats,
         )
 
 # ── LIVE START/STOP ──────────────────────────────────────────────────────────
@@ -2492,8 +1998,7 @@ def main():
     threading.Thread(target=_heartbeat, daemon=True, name="heartbeat").start()
     log.info("heartbeat: interval=%.0fs", HEARTBEAT_INTERVAL_S)
 
-    log.info("🟢 ready (mode=%s). Hold Right-⌘ or F18 to talk, or tap F19 to toggle.",
-             TYPER_MODE)
+    log.info("🟢 ready. Hold Right-⌘ or F18 to talk, or tap F19 to toggle.")
 
     def _cleanup():
         log.info("cleanup")

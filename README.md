@@ -72,39 +72,18 @@ the floating HUD when available, falling back to the older
 
 ## Configuration
 
-Everything is environment-variable driven so you can iterate without
-touching the source. Most useful knobs:
-
-### Model / accuracy
-
-| Var | Default | Notes |
-|---|---|---|
-| `TYPER_MODEL` | `…/whisper-large-v3-turbo` | Any MLX-hosted Whisper model id (e.g. `…/whisper-large-v3-mlx` for max accuracy at ~2× latency) |
-| `TYPER_MODE` | `release` | `release` — accumulate while held, transcribe once on release, paste (recommended); `live` — re-transcribe & diff-paste as you speak; `both` — stream live, then an authoritative correction pass on release. (`batch`→`release`, `stream`→`live` still accepted) |
-| `TYPER_WHISPER_LANGUAGE` | unset | `en`, `ru`, … — skip auto-detect |
-| `TYPER_INITIAL_PROMPT` | unset | Vocabulary/style prime — best lever for names & jargon |
-| `TYPER_CONDITION_ON_PREV` | `0` | Feed prior output back as conditioning. Off by default — on amplifies repetition loops/hallucinations |
-| `TYPER_HALLUCINATION_FILTER` | `0` | Master switch for the DOWNSTREAM text/segment hallucination filters (per-segment confidence drop + stock-phrase blocklist). **Off by default** — these were discarding legitimate short utterances ("yes", "no", "you", "bye"). Silence is still suppressed upstream by VAD + `TYPER_MIN_SPEECH_RMS` and Whisper's own `no_speech_threshold`. Set `1` to restore aggressive post-filtering for very noisy mics |
-| `TYPER_STRIP_HALLUCINATIONS` | `1` | Drop a transcription whose ENTIRE text is a stock hallucination phrase ("Thank you", "Thanks for watching", …). Only consulted when `TYPER_HALLUCINATION_FILTER=1` |
-| `TYPER_BEST_OF` | `5` | Number of samples to draw at each fallback temperature |
-| `TYPER_TEMPERATURE` | `0.0,0.2` | Whisper fallback temperatures (kept short to bound worst-case re-decode latency) |
-| `TYPER_HF_OFFLINE` | `1` when cache exists | Skip HuggingFace API check on startup |
-
-### Latency
+The **voice pipeline is fixed in code to mirror [Handy](https://github.com/cjpais/Handy)** —
+Silero VAD (threshold 0.3, onset/hangover smoothing) → one plain greedy
+decode on release (no prior-text context, Whisper's own no-speech gate) →
+filler/stutter cleanup → paste. There is nothing to tune there, and no
+live/streaming mode. Only a handful of settings remain:
 
 | Var | Default | Notes |
 |---|---|---|
-| `TYPER_PUSH_S` | `0.35` | Capture-loop tick interval (re-transcribe cadence in `live`/`both`; just audio-drain in `release`) |
-| `TYPER_MAX_BUFFER_S` | `28.0` | Cap on rolling audio buffer (Whisper context is 30 s) |
-
-### VAD (voice activity detection)
-
-| Var | Default | Notes |
-|---|---|---|
-| `TYPER_VAD_THRESHOLD` | `0.5` | Silero speech-probability threshold |
-| `TYPER_VAD_PRE_ROLL_MS` | `500` | Audio retained before speech onset |
-| `TYPER_VAD_HANGOVER_MS` | `400` | Silence required to mark end of utterance |
-| `TYPER_VAD_RMS_FLOOR` | `0.005` | Minimum RMS energy before VAD even runs |
+| `TYPER_MODEL` | `…/whisper-large-v3-turbo` | Any MLX-hosted Whisper model id (e.g. `…/whisper-large-v3-mlx` for slightly better non-English accuracy at ~2× latency) |
+| `TYPER_WHISPER_LANGUAGE` | unset | `en`, `ru`, … — pin a language instead of auto-detecting |
+| `TYPER_INITIAL_PROMPT` | unset | Custom words fed to Whisper so it spells your names/jargon right (Handy's "custom words") |
+| `TYPER_HF_OFFLINE` | `1` when cache exists | Skip the HuggingFace API check on startup |
 
 ### Mouse trigger (optional alternative to the hotkeys)
 
@@ -152,23 +131,27 @@ of knobs and what they do.
 
 ## How it works
 
-While you hold Right-⌘, audio is captured and passed through a Silero
-**voice-activity-detection (VAD) gate** that strips silence so Whisper
-never sees non-speech (the main source of hallucinations). In the default
-`release` mode that's *all* that happens during the hold — no Whisper runs
-until you let go, at which point a single pass transcribes the whole
-silence-trimmed utterance and the text is pasted in one shot. Because no
-per-tick transcription ever ran, there's no in-flight inference to wait out
-on release and no partial-window hallucinations to filter. For dictation
-longer than Whisper's ~30 s context window, the buffer is flushed at VAD
-silence boundaries and each chunk is transcribed exactly once.
+The voice pipeline is a direct port of [Handy](https://github.com/cjpais/Handy),
+the most popular open-source local dictation app:
 
-`live`/`both` modes additionally re-transcribe the growing buffer every
-tick and diff-paste the new suffix for real-time feedback (`both` then runs
-one authoritative pass on release to correct it). Decoding uses greedy
-`temperature=0` with a short fallback and `condition_on_previous_text=False`
-(the most-cited anti-repetition lever); degenerate segments are dropped via
-Whisper's own `no_speech_prob`/`avg_logprob`/`compression_ratio` metrics.
+1. While you hold the key, audio passes through a Silero **VAD gate**
+   (threshold 0.3) with Handy's onset/hangover smoothing — a 2-frame onset
+   debounce so a single noise blip can't open the gate, ~450 ms of pre-roll
+   so soft word onsets aren't clipped, and ~450 ms of hangover. Only voiced
+   audio is accumulated; Whisper never sees silence.
+2. **No transcription runs while you hold.** On release, the whole utterance
+   is transcribed *once* with a plain greedy decode (`temperature=0`,
+   `condition_on_previous_text=False`, Whisper's own `no_speech` gate at
+   0.2). A clip under 1 s is zero-padded to 1.25 s so short answers decode
+   cleanly.
+3. The text is cleaned with Handy's language-aware **filler/stutter filter**
+   (drops "uh"/"um"-type fillers for the spoken language, collapses 3+
+   repeated words) and pasted in one shot.
+
+That's the whole defense against hallucinations: the VAD keeps silence out
+of Whisper. There is deliberately no energy gate and no confidence/phrase
+post-filter — they were discarding legitimate short words, and Handy proves
+the VAD alone is enough.
 
 Text is delivered by copying it to the clipboard and synthesizing Cmd+V.
 That would clobber whatever you had copied, so by default Typer snapshots
